@@ -173,7 +173,74 @@ def coles_umap(cfg: dict) -> plt.Figure | None:
     return fig
 
 
+def pipeline_schema(cfg: dict | None = None) -> plt.Figure:
+    """Схема пайплайна (та же, что mermaid-диаграмма в README)."""
+    from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
+
+    boxes = {
+        "data": (0.07, 0.5, "Транзакции\nклиента", NEUTRAL),
+        "agg": (0.30, 0.74, "Агрегаты:\nMCC-профиль, суммы,\nвремя, динамика", NEUTRAL),
+        "coles": (0.30, 0.24, "CoLES-энкодер\n(GRU, предобучение\nбез меток)", NEUTRAL),
+        "gbm": (0.55, 0.86, "LightGBM", MALE),
+        "tabpfn": (0.55, 0.58, "TabPFN", MALE),
+        "ft": (0.55, 0.24, "CoLES, дообученный\nна пол", MALE),
+        "blend": (0.78, 0.5, "Калибровка\nи бленд логитов", ACCENT),
+        "pred": (0.95, 0.5, "Вероятность\nи класс", ACCENT),
+    }
+    fig, ax = plt.subplots(figsize=(10, 3.6))
+    ax.set_xlim(0, 1.03)
+    ax.set_ylim(0.05, 1.02)
+    ax.axis("off")
+    h = 0.2
+
+    def width(key: str) -> float:
+        return 0.09 if key in ("data", "pred") else 0.16
+
+    for key, (x, y, text, color) in boxes.items():
+        bw = width(key)
+        ax.add_patch(
+            FancyBboxPatch(
+                (x - bw / 2, y - h / 2),
+                bw,
+                h,
+                boxstyle="round,pad=0.01,rounding_size=0.02",
+                fc="white",
+                ec=color,
+                lw=1.6,
+            )
+        )
+        ax.text(x, y, text, ha="center", va="center", fontsize=8.6, color=INK)
+
+    def arrow(a: str, b: str, label: str = "") -> None:
+        (x1, y1), (x2, y2) = boxes[a][:2], boxes[b][:2]
+        if abs(x1 - x2) < 1e-9:  # вертикальная стрелка: от верхнего края к нижнему
+            p1, p2 = (x1, y1 + h / 2 + 0.012), (x2, y2 - h / 2 - 0.012)
+        else:  # от правого края к левому
+            p1, p2 = (x1 + width(a) / 2 + 0.012, y1), (x2 - width(b) / 2 - 0.012, y2)
+        ax.add_patch(FancyArrowPatch(p1, p2, arrowstyle="-|>", mutation_scale=11, color=INK, lw=0.9))
+        if label:
+            ax.text(x1 + 0.012, (p1[1] + p2[1]) / 2, label, fontsize=8, color=ACCENT, va="center")
+
+    for a, b in [
+        ("data", "agg"),
+        ("data", "coles"),
+        ("agg", "gbm"),
+        ("agg", "tabpfn"),
+        ("coles", "ft"),
+        ("gbm", "blend"),
+        ("tabpfn", "blend"),
+        ("ft", "blend"),
+        ("blend", "pred"),
+    ]:
+        arrow(a, b)
+    arrow("coles", "agg", "эмбеддинг")
+    ax.set_title("Схема решения")
+    fig.tight_layout()
+    return fig
+
+
 FIGURES = {
+    "00_pipeline.png": pipeline_schema,
     "01_mcc_gender_skew.png": mcc_gender_skew,
     "02_component_contribution.png": component_contribution,
     "03_roc_test.png": roc_test,
