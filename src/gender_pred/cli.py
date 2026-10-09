@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
+import sys
+import urllib.error
+import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,31 +63,116 @@ class Context:
         return pd.concat([X, E.astype(np.float32)], axis=1)
 
 
+class ArtifactsUnavailableError(RuntimeError):
+    """Артефакты не найдены локально и не могут быть скачаны."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, D102
+        return None
+
+
+def _download(url: str, target: Path, headers: dict | None = None) -> None:
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=60) as r, open(target, "wb") as fh:
+        shutil.copyfileobj(r, fh)
+
+
+def _from_url(rel: dict, target: Path) -> str:
+    if not rel.get("url"):
+        raise LookupError("публичная ссылка не задана (artifacts_release.url)")
+    _download(rel["url"], target)
+    return "публичная ссылка"
+
+
+def _from_gh(rel: dict, target: Path) -> str:
+    if shutil.which("gh") is None:
+        raise LookupError("gh не установлен")
+    if subprocess.run(["gh", "auth", "status"], capture_output=True).returncode != 0:
+        raise LookupError("gh не авторизован")
+    cmd = [
+        "gh",
+        "release",
+        "download",
+        rel["tag"],
+        "--repo",
+        rel["repo"],
+        "--pattern",
+        rel["asset"],
+        "--dir",
+        str(target.parent),
+        "--clobber",
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise LookupError(f"gh release download: {res.stderr.strip()}")
+    return "gh"
+
+
+def _from_token(rel: dict, target: Path) -> str:
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise LookupError("нет GH_TOKEN / GITHUB_TOKEN")
+    api = f"https://api.github.com/repos/{rel['repo']}/releases"
+    auth = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(f"{api}/tags/{rel['tag']}", headers=auth), timeout=60
+        ) as r:
+            assets = json.load(r)["assets"]
+    except urllib.error.HTTPError as e:
+        raise LookupError(f"GitHub API: HTTP {e.code}") from e
+    asset = next((a for a in assets if a["name"] == rel["asset"]), None)
+    if asset is None:
+        raise LookupError(f"в релизе {rel['tag']} нет {rel['asset']}")
+    # ассет отдаётся редиректом на хранилище; токен туда не передаётся
+    req = urllib.request.Request(
+        f"{api}/assets/{asset['id']}", headers={**auth, "Accept": "application/octet-stream"}
+    )
+    try:
+        urllib.request.build_opener(_NoRedirect).open(req, timeout=60)
+        raise LookupError("GitHub API не вернул ссылку на файл")
+    except urllib.error.HTTPError as e:
+        if e.code not in (301, 302, 303, 307, 308):
+            raise LookupError(f"GitHub API: HTTP {e.code}") from e
+        _download(e.headers["Location"], target)
+    return "GitHub API (токен)"
+
+
 def fetch_artifacts(cfg: dict) -> None:
-    """Скачивает artifacts.zip из GitHub Release (нужен ``gh`` с доступом к репозиторию)."""
+    """Готовит artifacts/: уже распакованные файлы, ``artifacts/artifacts.zip``, положенный вручную,
+    либо скачивание из GitHub Release — по публичной ссылке, через ``gh`` или по токену ``GH_TOKEN``."""
     path = Path(cfg["paths"]["artifacts"])
     if (path / "model" / "model.json").exists():
         return
     rel = cfg["artifacts_release"]
     path.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            "gh",
-            "release",
-            "download",
-            rel["tag"],
-            "--repo",
-            rel["repo"],
-            "--pattern",
-            rel["asset"],
-            "--dir",
-            str(path),
-            "--clobber",
-        ],
-        check=True,
-    )
-    with zipfile.ZipFile(path / rel["asset"]) as z:
+    archive = path / rel["asset"]
+    if not archive.exists():
+        errors = []
+        for source in (_from_url, _from_gh, _from_token):
+            try:
+                print(f"artifacts: скачано ({source(rel, archive)})")
+                break
+            except (LookupError, OSError) as e:
+                archive.unlink(missing_ok=True)
+                errors.append(f"  - {e}")
+        else:
+            raise ArtifactsUnavailableError(
+                f"Не удалось получить {rel['asset']} из релиза {rel['tag']} репозитория {rel['repo']}:\n"
+                + "\n".join(errors)
+                + "\n\nВарианты:\n"
+                "  1) gh auth login  (аккаунт с доступом к репозиторию) и повторить запуск;\n"
+                "  2) export GH_TOKEN=<токен с правом чтения репозитория> и повторить запуск;\n"
+                f"  3) скачать {rel['asset']} со страницы https://github.com/{rel['repo']}/releases/tag/{rel['tag']}"
+                f" и положить в {archive} — распакуется автоматически;\n"
+                "  4) обучить всё заново: retrain: true в configs/default.yaml / RETRAIN = True"
+                " в ноутбуке / make train (GPU, ~25 мин)."
+            )
+    with zipfile.ZipFile(archive) as z:
         z.extractall(path)
+    if not (path / "model" / "model.json").exists():
+        raise ArtifactsUnavailableError(f"{archive} не содержит model/model.json")
 
 
 def build_context(cfg: dict, splits: dict[str, pd.DataFrame], log: bool = True) -> Context:
@@ -291,7 +381,10 @@ def main(argv: list[str] | None = None) -> None:
         download_data(cfg["paths"]["data"])
         train(dict(cfg, retrain=True, retrain_tabular=True, retrain_seq=True))
     elif args.command == "evaluate":
-        print(json.dumps(evaluate(cfg), indent=1))
+        try:
+            print(json.dumps(evaluate(cfg), indent=1))
+        except ArtifactsUnavailableError as e:
+            sys.exit(f"Ошибка: {e}")
     else:
         figures(cfg)
 

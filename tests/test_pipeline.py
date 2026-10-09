@@ -40,3 +40,14 @@ def test_test_labels_not_used(splits, tiny_cfg):
     b = cli.train(tiny_cfg, splits=shuffled)
     pd.testing.assert_frame_equal(a.oof_, b.oof_)
     np.testing.assert_allclose(a.blend_.weights_, b.blend_.weights_)
+
+
+def test_artifacts_unavailable_gives_instructions(tiny_cfg, monkeypatch):
+    """Без артефактов, gh и токена — понятная ошибка с вариантами, а не падение subprocess."""
+    import pytest
+
+    monkeypatch.setattr(cli.shutil, "which", lambda _: None)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    with pytest.raises(cli.ArtifactsUnavailableError, match="Варианты"):
+        cli.fetch_artifacts(tiny_cfg)

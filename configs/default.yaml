@@ -9,7 +9,7 @@ paths:
   results: results
   figures: reports/figures
 
-# false: модели и предсказания берутся из artifacts/ (скачиваются из GitHub Release);
+# false: модели берутся из artifacts/ (artifacts.zip из GitHub Release: публичная ссылка, gh или GH_TOKEN);
 # true: полный пересчёт. retrain_tabular / retrain_seq переопределяют retrain по частям.
 retrain: false
 retrain_tabular: null
@@ -18,6 +18,7 @@ artifacts_release:
   repo: Eltralo/gender-prediction
   tag: v1.0.0
   asset: artifacts.zip
+  url: null               # публичная ссылка на artifacts.zip (если задана — скачивается без авторизации)
 
 cv:
   n_splits: 5
