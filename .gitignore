@@ -1,0 +1,27 @@
+# данные и артефакты (artifacts/ публикуется архивом в GitHub Release)
+data/
+artifacts/
+*.zip
+
+# локальные рабочие материалы
+experiments/
+feats/
+models/
+logs/
+STATUS.md
+catboost_info/
+
+# промежуточные предсказания
+results/*.parquet
+
+# кэши
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+.cache/
+.DS_Store
+.vscode/
+.idea/

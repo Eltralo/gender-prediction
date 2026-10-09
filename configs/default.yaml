@@ -1,0 +1,103 @@
+# Все гиперпараметры, сиды и флаги пайплайна.
+
+seed: 42
+device: auto              # auto | cuda | cpu
+
+paths:
+  data: data
+  artifacts: artifacts
+  results: results
+  figures: reports/figures
+
+# false: модели и предсказания берутся из artifacts/ (скачиваются из GitHub Release);
+# true: полный пересчёт. retrain_tabular / retrain_seq переопределяют retrain по частям.
+retrain: false
+retrain_tabular: null
+retrain_seq: null
+artifacts_release:
+  repo: Eltralo/gender-prediction
+  tag: v1.0.0
+  asset: artifacts.zip
+
+cv:
+  n_splits: 5
+  repeats: 2              # оценка качества: 2 × 5 фолдов
+  fold_seed: 100          # сплиты повтора r: StratifiedKFold(random_state=fold_seed + r)
+  inner_splits: 5         # OOF-признаки с метками внутри обучения
+
+features:
+  top_mcc_amount: 40      # средняя сумма расхода — по топ-N MCC
+  windows_days: [30, 90, 180]
+  decay_tau_days: [7, 30, 90]
+  autocorr_lags: [1, 7, 14, 30]
+  target_encoding:
+    smoothing: {mcc: 20.0, tr_type: 20.0}
+  tfidf_logreg_C: 1.0
+  embedding_logreg_C: 0.05
+
+gbm:
+  params:
+    objective: binary
+    learning_rate: 0.02
+    num_leaves: 15
+    min_child_samples: 30
+    feature_fraction: 0.25
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    lambda_l2: 10.0
+    verbose: -1
+  max_rounds: 3000
+  eval_step: 50
+  final_rounds_scale: 1.25   # финальная модель на всех данных: среднее выбранное число итераций × 1.25
+  seeds: [0]
+  num_threads: 16
+
+sequence:
+  # Энкодер CoLES: GRU над транзакциями (MCC, тип, сумма, час, день недели, Δt)
+  encoder:
+    hidden: 1024
+    mcc_dim: 48
+    tr_type_dim: 24
+    use_time: true
+    emb_noise: 0.003
+  pretrain:
+    clients: labeled        # labeled — только train+val; all — все клиенты без меток (включая test)
+    epochs: 50
+    batch_size: 128
+    lr: 0.002
+    step_size: 10
+    gamma: 0.9025
+    n_slices: 5
+    slice_min: 15
+    slice_max: 75
+    min_seq_len: 25
+    trx_dropout: 0.01
+    margin: 0.5
+    neg_count: 5
+    embed_max_len: 2000
+  finetune:
+    epochs: 8
+    batch_size: 32
+    lr_encoder: 0.0001
+    lr_head: 0.005
+    gamma: 0.4
+    slice_min: 250
+    slice_max: 350
+    slice_rate_for_min: 0.9
+    trx_dropout: 0.01
+    predict_max_len: 1200
+    seeds: [42]
+
+tabpfn:
+  enabled: true
+  top_k: 300
+  n_estimators: 8
+
+blend:
+  components: [gbm, seq, tabpfn]
+  weight_step: 0.05
+  threshold: 0.5
+
+report:
+  bootstrap: 2000
+  ci: 0.95
