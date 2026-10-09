@@ -1,0 +1,22 @@
+{
+ "components": [
+  "gbm",
+  "seq",
+  "tabpfn"
+ ],
+ "blend_weights": [
+  0.7,
+  0.1,
+  0.2
+ ],
+ "auc_mean": 0.8907202695893173,
+ "auc_std": 0.012129509406066448,
+ "accuracy_mean": 0.8043898809523808,
+ "accuracy_std": 0.01321461528081806,
+ "folds_auc_below_0.88": 2,
+ "folds_accuracy_below_0.80": 4,
+ "n_folds": 10,
+ "auc_gbm_mean": 0.8899763344491236,
+ "auc_seq_mean": 0.8663769211388258,
+ "auc_tabpfn_mean": 0.8874219396753411
+}
