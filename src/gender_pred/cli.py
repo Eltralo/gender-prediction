@@ -410,6 +410,7 @@ def main(argv: list[str] | None = None) -> None:
         download_data(cfg["paths"]["data"])
         train(dict(cfg, retrain=True, retrain_tabular=True, retrain_seq=True))
     elif args.command == "evaluate":
+        download_data(cfg["paths"]["data"])
         try:
             print(json.dumps(evaluate(cfg), indent=1))
         except ArtifactsUnavailableError as e:
