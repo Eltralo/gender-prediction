@@ -26,7 +26,7 @@ flowchart LR
 ```
 
 ```bash
-make setup      # окружение conda gender_hw + пакет
+make setup      # новая conda-среда gender_hw + пакет (без GPU: make setup ENV_FILE=environment-cpu.yml)
 make evaluate   # метрики на test по финальной модели (артефакты из GitHub Release)
 make train      # полный пересчёт: признаки, CoLES, кросс-валидация, финальные модели (~25 мин на GPU)
 ```
@@ -47,7 +47,25 @@ make train      # полный пересчёт: признаки, CoLES, кро
 
 ## Запуск
 
-**Окружение.** `make setup` создаёт conda-среду `gender_hw` из [environment.yml](environment.yml) (Python 3.11, PyTorch 2.11 с CUDA 12.8) и ставит пакет. Для CPU уберите из `environment.yml` строку `--extra-index-url`.
+**Быстрый старт** — ноутбук с готовыми моделями:
+
+```bash
+git clone https://github.com/Eltralo/gender-prediction.git && cd gender-prediction
+conda env create -f environment.yml          # без GPU: environment-cpu.yml
+conda activate gender_hw && pip install -e ".[tabpfn]"
+jupyter lab notebooks/pred_gen_tr.ipynb      # Run → Run All Cells
+```
+
+Ноутбук сам скачает данные с Hugging Face и финальные модели из [GitHub Release](https://github.com/Eltralo/gender-prediction/releases/tag/v1.0.0) — авторизация не нужна. Финальная ячейка выведет **AUC 0.898 / accuracy 0.811** на test.
+
+- `make evaluate` — то же без ноутбука: метрики на test с 95% CI → `results/test_metrics.json`.
+- Обучение с нуля: `RETRAIN = True` в первой ячейке ноутбука или `make train` (~25 мин на GPU).
+- `make lint` — проверка кода ruff (её же запускает CI); `make figures` — пересоздать графики в `reports/figures/`.
+
+<details>
+<summary>Подробнее: флаги пересчёта, артефакты, CPU, время</summary>
+
+**Окружение.** `make setup` создаёт conda-среду из [environment.yml](environment.yml) (Python 3.11, PyTorch 2.11 с CUDA 12.8) и ставит пакет. Имя среды — переменная `ENV` (по умолчанию `gender_hw`), файл окружения — `ENV_FILE`: `make setup ENV=my_env ENV_FILE=environment-cpu.yml`. Существующую среду `setup` не изменяет: он остановится и подскажет команду для явного обновления. Цели `train` / `evaluate` / `lint` / `figures` запускаются в среде `ENV` через `conda run`.
 
 **Данные** скачиваются с Hugging Face в `data/` автоматически (`python -m gender_pred.cli data`).
 
@@ -55,19 +73,21 @@ make train      # полный пересчёт: признаки, CoLES, кро
 
 | Флаг | По умолчанию | Действие |
 |---|---|---|
-| `retrain` | `false` | `false`: финальные модели из `artifacts/` (см. «Артефакты» ниже); `true`: полный пересчёт |
+| `retrain` | `false` | `false`: финальные модели из `artifacts/`; `true`: полный пересчёт |
 | `retrain_tabular`, `retrain_seq` | `null` (= `retrain`) | пересчёт по частям: табличные модели и бленд / энкодер CoLES |
 
-**Артефакты.** Финальные модели (25 МБ) лежат архивом `artifacts.zip` в [GitHub Release v1.0.0](https://github.com/Eltralo/gender-prediction/releases/tag/v1.0.0). Репозиторий приватный, поэтому для скачивания нужен доступ; источники перебираются по порядку:
-
-1. уже распакованный `artifacts/` или архив, положенный вручную в `artifacts/artifacts.zip` (скачайте его со страницы релиза);
-2. `artifacts_release.url` в конфиге — публичная ссылка на архив, если задана;
-3. `gh release download` — если `gh` установлен и выполнен `gh auth login`;
-4. GitHub API с токеном из `GH_TOKEN` или `GITHUB_TOKEN` (право чтения репозитория) — без `gh`.
-
-Если ни один источник недоступен, запуск останавливается с сообщением и этими вариантами; без артефактов модель можно обучить заново (`make train`).
-
 В ноутбуке тот же переключатель — `RETRAIN` в первой ячейке с кодом. Все гиперпараметры и сиды — в том же YAML.
+
+**Артефакты.** Финальные модели (25 МБ) — архив `artifacts.zip` в GitHub Release v1.0.0. Источники перебираются по порядку:
+
+1. уже распакованный `artifacts/` или архив, положенный вручную в `artifacts/artifacts.zip`;
+2. публичная ссылка `artifacts_release.url` из конфига — без авторизации;
+3. `gh release download` — если `gh` установлен и авторизован;
+4. GitHub API с токеном из `GH_TOKEN` / `GITHUB_TOKEN`.
+
+Если ни один источник недоступен, запуск останавливается с сообщением и вариантами действий; без артефактов модель можно обучить заново (`make train`).
+
+**CPU.** Без GPU используйте `environment-cpu.yml` (PyTorch CPU-сборка); устройство выбирается автоматически (`device: auto`). Метрики выше получены на GPU; на CPU из-за численных различий GRU и TabPFN они могут отличаться в третьем-четвёртом знаке (проверено: AUC 0.8979, accuracy 0.8125 против 0.8113).
 
 **Время** (RTX 5090 Laptop / 24 ядра CPU):
 
@@ -76,23 +96,22 @@ make train      # полный пересчёт: признаки, CoLES, кро
 | `make evaluate`, ноутбук с `RETRAIN = False` | ~2 мин | ~40 мин (эмбеддинги GRU и TabPFN на CPU) |
 | `make train` (полный пересчёт) | ~25 мин | нецелесообразно: обучение GRU на CPU ≈ сутки |
 
-Метрики выше получены на GPU; на CPU из-за численных различий GRU и TabPFN они могут отличаться в третьем-четвёртом знаке (проверено: AUC 0.8979, accuracy 0.8125 против 0.8113).
-
-`make lint` — проверка кода линтером ruff (её же запускает CI); `make figures` пересоздаёт графики из `results/`.
+</details>
 
 ## Структура
 
 ```
 configs/default.yaml        гиперпараметры, сиды, флаги пересчёта
 src/gender_pred/
-    data.py                 загрузка, конфиг, подготовка транзакций
+    data.py                 загрузка, конфиг, подготовка транзакций, анализ данных
     features.py             агрегаты клиента и признаки с метками
     sequence.py             CoLES: энкодер, предобучение, дообучение
     models.py               LightGBM, TabPFN, калиброванный бленд
-    cv.py                   кросс-валидация, финальное обучение, метрики
+    cv.py                   кросс-валидация, финальное обучение, метрики, сила сигнала групп
     cli.py                  команды train / evaluate / figures
     plots.py                графики
-notebooks/pred_gen_tr.ipynb ноутбук задания
-results/                    метрики CV и test, вклад компонентов, важности
+notebooks/pred_gen_tr.ipynb ноутбук задания: анализ данных, признаки, модели, оценка
+environment.yml             окружение (GPU); environment-cpu.yml — без CUDA
+results/                    метрики CV и test, вклад компонентов, важности, анализ данных
 reports/figures/            графики
 ```
