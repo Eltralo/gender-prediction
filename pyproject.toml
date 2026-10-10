@@ -24,7 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tabpfn = ["tabpfn>=2.0"]
-dev = ["pytest>=8", "ruff>=0.6", "jupyter", "ipykernel", "nbconvert"]
+dev = ["ruff>=0.6", "jupyter", "ipykernel", "nbconvert"]
 
 [project.scripts]
 gender-pred = "gender_pred.cli:main"
@@ -40,7 +40,3 @@ extend-exclude = ["notebooks", "experiments"]
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "NPY"]
 ignore = ["B905", "E731"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-q"

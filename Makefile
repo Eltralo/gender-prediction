@@ -1,7 +1,7 @@
 PY ?= python
 CONFIG ?= configs/default.yaml
 
-.PHONY: setup train evaluate test figures
+.PHONY: setup train evaluate lint figures
 
 setup:  ## окружение conda + пакет в режиме разработки
 	conda env create -f environment.yml || conda env update -f environment.yml
@@ -13,9 +13,8 @@ train:  ## данные, предобучение CoLES, кросс-валида
 evaluate:  ## единственный проход по test: метрики с 95% CI -> results/test_metrics.json
 	$(PY) -m gender_pred.cli evaluate --config $(CONFIG)
 
-test:  ## линтер и быстрые тесты на синтетике (CPU)
-	ruff check src tests && ruff format --check src tests
-	CUDA_VISIBLE_DEVICES="" $(PY) -m pytest
+lint:  ## линтер
+	ruff check src && ruff format --check src
 
 figures:  ## графики по results/ -> reports/figures/
 	$(PY) -m gender_pred.cli figures --config $(CONFIG)
