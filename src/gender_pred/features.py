@@ -403,23 +403,37 @@ class LabelFeatures:
         return self._apply(self.parts_, X, np.arange(len(X)))
 
 
-def feature_groups(X: pd.DataFrame, n_examples: int = 3) -> pd.DataFrame:
-    """Группа признаков -> число колонок -> примеры колонок (по префиксу имени)."""
-    prefix = X.columns.str.split("_").str[0]
+LABEL_FEATURES = {
+    "lr_tfidf": "логрег по TF-IDF числа операций по MCC и типам и сумм по MCC",
+    "lr_emb": "логрег по эмбеддингу CoLES (1024 → 1 число)",
+    "te_mcc_*": "доля мужчин по MCC клиента: 9 сводок (среднее, max, разброс, лог-шансы…)",
+    "te_tt_wmean": "доля мужчин по типам операций клиента, среднее по операциям",
+}
+
+
+def label_feature_summary(L: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
+    """Признаки с метками (out-of-fold): что это, AUC в одиночку по клиентам без пропуска, покрытие."""
+    from sklearn.metrics import roc_auc_score
+
+    yv = y.reindex(L.index)
+
+    def auc(c: str) -> float:
+        m = L[c].notna()
+        return roc_auc_score(yv[m], L.loc[m, c])
+
     rows = []
-    for p, name in GROUP_PREFIXES.items():
-        cols = X.columns[prefix == p]
-        if len(cols):
-            step = max(len(cols) // n_examples, 1)
-            rows.append(
-                {
-                    "группа": name,
-                    "префикс": f"{p}_",
-                    "признаков": len(cols),
-                    "примеры": ", ".join(cols[::step][:n_examples]),
-                }
-            )
-    return pd.DataFrame(rows)
+    for name, what in LABEL_FEATURES.items():
+        cols = [c for c in L.columns if c.startswith(name[:-1])] if name.endswith("*") else [name]
+        aucs = [auc(c) for c in cols]
+        rows.append(
+            {
+                "признак": name,
+                "что это": what,
+                "AUC в одиночку": f"{min(aucs):.3f}–{max(aucs):.3f}" if len(cols) > 1 else f"{aucs[0]:.3f}",
+                "покрытие, %": round(100 * L[cols].notna().all(axis=1).mean(), 1),
+            }
+        )
+    return pd.DataFrame(rows).set_index("признак")
 
 
 def model_matrix(X: pd.DataFrame, label_feats: pd.DataFrame) -> pd.DataFrame:

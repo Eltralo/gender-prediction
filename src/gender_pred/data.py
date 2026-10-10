@@ -94,26 +94,6 @@ def split_overview(
     return pd.DataFrame(rows).T
 
 
-def data_quality(df: pd.DataFrame) -> pd.Series:
-    """Пропуски, дубликаты, нераспознанные даты, согласованность пола, выбросы сумм."""
-    a = df["amount"].abs()
-    p99, p999 = a.quantile([0.99, 0.999])
-    per_client = df.groupby("customer_id")["gender"].nunique() if "gender" in df else None
-    return pd.Series(
-        {
-            "строк": len(df),
-            "полных дубликатов строк": int(df.duplicated().sum()),
-            "нераспознанных дат (NaT)": int(df["tr_datetime"].isna().sum()),
-            "клиентов с > 1 значением пола": int((per_client > 1).sum()) if per_client is not None else "—",
-            "|amount|: 99-й перцентиль": round(p99, 2),
-            "|amount|: 99.9-й перцентиль": round(p999, 2),
-            "|amount|: максимум": round(a.max(), 2),
-            "доля операций с |amount| > 99.9-го перцентиля": round((a > p999).mean(), 4),
-        },
-        dtype=object,
-    )
-
-
 @dataclass
 class Vocab:
     """Словари категорий, фиксируемые по train: одинаковые колонки на любом сплите."""
@@ -179,67 +159,3 @@ class SequenceStore:
 
 
 SEQ_STORE = SequenceStore()
-
-
-# ---------------------------------------------------------------- анализ данных (раздел «Данные» ноутбука)
-
-
-def midnight_check(df: pd.DataFrame, top: int = 5) -> tuple[pd.Series, pd.DataFrame]:
-    """00:00:00 против соседних секунд; типы операций с наибольшей долей 00:00:00."""
-    sec = (df["tr_datetime"] - df["tr_datetime"].dt.normalize()).dt.total_seconds()
-    mid = sec == 0
-    summary = pd.Series(
-        {
-            "операций в 00:00:00": int(mid.sum()),
-            "в среднем за секунду 00:00:01–00:00:59": round(sec.between(1, 59).sum() / 59, 1),
-            "в среднем за секунду суток": round(len(sec) / 86400, 1),
-            "доля операций в 00:00:00": round(mid.mean(), 3),
-        },
-        dtype=object,
-    )
-    by_type = (
-        df.assign(mid=mid)
-        .groupby("tr_type")
-        .agg(desc=("tr_type_desc", "first"), операций=("mid", "size"), доля_00=("mid", "mean"))
-        .sort_values("операций", ascending=False)
-    )
-    by_type["доля всех 00:00:00"] = (by_type["операций"] * by_type["доля_00"]) / mid.sum()
-    return summary, by_type.sort_values("доля всех 00:00:00", ascending=False).head(top).round(3)
-
-
-def amount_scale(df: pd.DataFrame) -> tuple[float, pd.Series]:
-    """Масштаб сумм: самая частая |amount| как единица и распределение |amount| в этих единицах."""
-    a = df["amount"].abs()
-    unit = float(a.mode().iloc[0])
-    r = a / unit
-    return unit, r.round(2).value_counts().head(12).rename("операций")
-
-
-def round_share(df: pd.DataFrame, unit: float, tol: float = 0.002) -> pd.Series:
-    """Доля операций клиента с целым числом единиц масштаба (index = customer_id)."""
-    r = df["amount"].abs() / unit
-    return (np.abs(r - np.round(r)) < tol).groupby(df["customer_id"]).mean()
-
-
-def terminal_overview(train: pd.DataFrame, test: pd.DataFrame) -> pd.Series:
-    """Клиентов на терминал (train) и пересечение терминалов train/test (без меток)."""
-
-    def known(df: pd.DataFrame) -> pd.DataFrame:
-        t = df["term_id"].astype(str)
-        return df.assign(term=t)[~t.isin(["-1", "-1.0", "nan"])]
-
-    tr, te = known(train), known(test)
-    per_term = tr.groupby("term")["customer_id"].nunique()
-    seen = te["term"].isin(set(tr["term"]))
-    return pd.Series(
-        {
-            "терминалов в train": len(per_term),
-            "клиентов на терминал, медиана": int(per_term.median()),
-            "доля терминалов с одним клиентом": round((per_term == 1).mean(), 3),
-            "доля операций test на терминалах из train": round(seen.mean(), 3),
-            "доля клиентов test с хотя бы одним терминалом из train": round(
-                te.loc[seen, "customer_id"].nunique() / test["customer_id"].nunique(), 3
-            ),
-        },
-        dtype=object,
-    )

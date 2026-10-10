@@ -514,63 +514,39 @@ def model_summary(results: str | Path) -> pd.DataFrame:
     ).set_index("модель")
 
 
-def hyperparameter_tables(cfg: dict) -> dict[str, pd.DataFrame]:
-    """Гиперпараметры из конфига по моделям: параметр, значение, источник."""
+def hyperparameter_summary(
+    cfg: dict, results: str | Path = "results", n_trees: int | None = None
+) -> pd.DataFrame:
+    """Ключевые гиперпараметры по моделям одной таблицей: модель, параметры, как выбраны."""
     g, gp, e = cfg["gbm"], cfg["gbm"]["params"], cfg["sequence"]["encoder"]
-    p, f, t, b = cfg["sequence"]["pretrain"], cfg["sequence"]["finetune"], cfg["tabpfn"], cfg["blend"]
-    ptls, fixed, nested = "эталонный конфиг ptls", "фиксировано", "вложенно по CV"
-    tables = {
-        "LightGBM": [
-            ("learning_rate", gp["learning_rate"], "фиксировано; Optuna не улучшил"),
-            ("num_leaves", gp["num_leaves"], "фиксировано; Optuna не улучшил"),
-            ("min_child_samples", gp["min_child_samples"], "фиксировано; Optuna не улучшил"),
-            ("feature_fraction", gp["feature_fraction"], "фиксировано; Optuna не улучшил"),
-            ("bagging_fraction", gp["bagging_fraction"], "фиксировано; Optuna не улучшил"),
-            ("lambda_l2", gp["lambda_l2"], "фиксировано; Optuna не улучшил"),
-            ("число деревьев", f"≤ {g['max_rounds']}, шаг {g['eval_step']}", nested),
-            ("деревьев в финале", f"среднее × {g['final_rounds_scale']}", fixed),
-            ("сидов", len(g["seeds"]), "проверено по CV: 1 / 5"),
-        ],
-        "CoLES, предобучение": [
-            ("GRU hidden", e["hidden"], ptls),
-            ("эмбеддинги MCC / типа", f"{e['mcc_dim']} / {e['tr_type_dim']}", ptls),
-            ("час, день недели, Δt", "да" if e["use_time"] else "нет", "проверено по CV: с / без"),
-            ("шум эмбеддингов", e["emb_noise"], ptls),
-            ("оптимизатор, lr", f"Adam, {p['lr']}", ptls),
-            ("шедулер", f"StepLR({p['step_size']}, {p['gamma']})", ptls),
-            ("эпох", p["epochs"], "проверено по CV: 25 / 50 / 75"),
-            ("батч, клиентов", p["batch_size"], ptls),
-            ("срезов на клиента", p["n_slices"], ptls),
-            ("длина среза", f"{p['slice_min']}–{p['slice_max']}", ptls),
-            ("loss", f"contrastive, margin {p['margin']}", ptls),
-            ("негативов на якорь", p["neg_count"], ptls),
-            ("dropout транзакций", p["trx_dropout"], ptls),
-            ("клиенты", "train + val", "проверено по CV: + test без меток"),
-        ],
-        "CoLES, дообучение": [
-            ("оптимизатор", "Adam", ptls),
-            ("lr энкодера / головы", f"{f['lr_encoder']} / {f['lr_head']}", ptls),
-            ("шедулер", f"StepLR(1, {f['gamma']})", ptls),
-            ("эпох", f["epochs"], ptls),
-            ("батч", f["batch_size"], ptls),
-            ("длина среза", f"{f['slice_min']}–{f['slice_max']}", ptls),
-            ("dropout транзакций", f["trx_dropout"], ptls),
-            ("история при предсказании", f"{f['predict_max_len']} операций", fixed),
-            ("TTA по срезам", "нет", "проверено по CV: 10 / 20"),
-            ("сидов", len(f["seeds"]), "проверено по CV: 1 / 3"),
-        ],
-        "TabPFN v2": [
-            ("признаков", t["top_k"], fixed),
-            ("отбор признаков", "gain LightGBM", "внутри обучения"),
-            ("ансамблей", t["n_estimators"], fixed),
-        ],
-        "Бленд": [
-            ("калибровка", "Platt", "по OOF"),
-            ("веса", f"симплекс, шаг {b['weight_step']}", nested),
-            ("порог", b["threshold"], fixed),
-        ],
-    }
-    return {
-        name: pd.DataFrame(rows, columns=["параметр", "значение", "источник"]).set_index("параметр")
-        for name, rows in tables.items()
-    }
+    p, f, t = cfg["sequence"]["pretrain"], cfg["sequence"]["finetune"], cfg["tabpfn"]
+    meta = json.loads((Path(results) / "cv_metrics.json").read_text())
+    w = dict(zip(meta["components"], meta["blend_weights"]))
+    trees = f"деревьев: {n_trees}" if n_trees else f"деревьев: до {g['max_rounds']}"
+    rows = [
+        (
+            "LightGBM",
+            f"lr {gp['learning_rate']}, {gp['num_leaves']} листьев, "
+            f"feature_fraction {gp['feature_fraction']}, "
+            f"L2 {gp['lambda_l2']:g}; {trees}",
+            "параметры фиксированы (Optuna не улучшила на внешних фолдах); число деревьев — вложенно по CV",
+        ),
+        (
+            "CoLES, предобучение",
+            f"GRU {e['hidden']}, Adam lr {p['lr']} + StepLR, {p['epochs']} эпох, contrastive loss "
+            f"по {p['n_slices']} срезам",
+            "конфиг ptls; эпохи — по CV",
+        ),
+        (
+            "CoLES, дообучение",
+            f"Adam, lr энкодера {f['lr_encoder']:g} / головы {f['lr_head']:g}, {f['epochs']} эпох",
+            "конфиг ptls",
+        ),
+        ("TabPFN v2", f"{t['top_k']} признаков по gain LightGBM", "фиксировано"),
+        (
+            "Бленд",
+            f"Platt; веса LightGBM {w['gbm']:.1f} / TabPFN {w['tabpfn']:.1f} / CoLES {w['seq']:.1f}",
+            "вложенно по CV",
+        ),
+    ]
+    return pd.DataFrame(rows, columns=["модель", "ключевые параметры", "как выбраны"]).set_index("модель")
