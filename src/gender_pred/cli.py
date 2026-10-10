@@ -219,7 +219,9 @@ def train(cfg: dict, ctx: Context | None = None, splits: dict | None = None) -> 
     model.fit_final(X, y, ctx.seqs, ctx.encoder.state_dict())
     model.save(ctx.artifacts / "model")
     write_cv_results(cfg, model, y)
+    write_model_table(cfg, model, X, y)
     write_descriptive_results(cfg, model, splits["train"])
+    write_data_results(cfg, X, y, ctx.features(splits["train"]), ctx.features(splits["test"]))
     return model
 
 
@@ -335,6 +337,24 @@ def write_cv_results(cfg: dict, model: cv.GenderModel, y: pd.Series) -> dict:
     }
     (res / "cv_metrics.json").write_text(json.dumps(summary, indent=1, ensure_ascii=False))
     return summary
+
+
+def write_model_table(cfg: dict, model: cv.GenderModel, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
+    """Метрики CV по каждой модели и бленду -> results/cv_models.csv."""
+    t = model.model_table(y)
+    t = pd.concat([pd.DataFrame([cv.embedding_cv(X, y, cfg)]), t], ignore_index=True)
+    t.to_csv(Path(cfg["paths"]["results"]) / "cv_models.csv", index=False)
+    return t
+
+
+def write_data_results(
+    cfg: dict, X_lab: pd.DataFrame, y: pd.Series, X_train: pd.DataFrame, X_test: pd.DataFrame
+) -> None:
+    """Сила сигнала групп признаков (метки train+val) и adversarial validation train vs test (без меток)."""
+    res = Path(cfg["paths"]["results"])
+    cv.group_signal(X_lab, y, cfg).to_csv(res / "group_signal.csv", index=False)
+    adv = cv.adversarial_auc(X_train, X_test, cfg)
+    (res / "adversarial_validation.json").write_text(json.dumps(adv, indent=1, ensure_ascii=False))
 
 
 def evaluate(

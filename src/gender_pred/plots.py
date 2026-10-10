@@ -65,17 +65,194 @@ def _results(cfg: dict) -> Path:
     return Path(cfg["paths"]["results"])
 
 
+def _by_gender(ax: plt.Axes, values: pd.Series, gender: pd.Series, bins: np.ndarray) -> None:
+    for g, color, name in ((0, FEMALE, "женщины"), (1, MALE, "мужчины")):
+        v = values[gender.reindex(values.index).to_numpy() == g]
+        ax.hist(v, bins=bins, density=True, histtype="step", lw=2, color=color, label=name)
+
+
+def time_volume(df: pd.DataFrame) -> plt.Figure:
+    """Операций по дням периода и доля операций по day % 7 (train)."""
+    day = (df["tr_datetime"] - df["tr_datetime"].min()).dt.days
+    daily = day.value_counts().sort_index()
+    dow = (day % 7).value_counts(normalize=True).sort_index() * 100
+    low = dow.nsmallest(2).index
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 3.6), gridspec_kw={"width_ratios": [2.4, 1]})
+    a1.plot(daily.index, daily.to_numpy(), color=NEUTRAL, lw=0.8)
+    a1.plot(
+        daily.index,
+        daily.rolling(28, center=True).mean().to_numpy(),
+        color=MALE,
+        lw=2,
+        label="среднее за 28 дней",
+    )
+    a1.set_xlabel("день от начала периода")
+    a1.set_ylabel("операций в день")
+    a1.set_title("Объём операций по дням (train)")
+    a1.legend(frameon=False, loc="lower right")
+    a2.bar(dow.index, dow.to_numpy(), color=[ACCENT if d in low else NEUTRAL for d in dow.index])
+    a2.set_ylim(dow.min() * 0.9, dow.max() * 1.05)
+    a2.set_xlabel("day % 7")
+    a2.set_ylabel("доля операций, %")
+    a2.set_title("По дням недели")
+    a2.text(
+        0.98,
+        0.97,
+        "провалы —\nвероятно, выходные",
+        color=ACCENT,
+        transform=a2.transAxes,
+        ha="right",
+        va="top",
+        fontsize=8.5,
+    )
+    fig.tight_layout()
+    return fig
+
+
+def hourly_by_gender(df: pd.DataFrame) -> plt.Figure:
+    """Доля операций по часам у мужчин и женщин; операции с временем 00:00:00 исключены (время неизвестно)."""
+    t = df["tr_datetime"]
+    known = (t - t.dt.normalize()) != pd.Timedelta(0)
+    d = df.loc[known].assign(hour=t[known].dt.hour)
+    share = d.groupby("gender")["hour"].value_counts(normalize=True).unstack(0).sort_index() * 100
+    fig, ax = plt.subplots(figsize=(8, 3.6))
+    ax.plot(share.index, share[0], color=FEMALE, lw=2, marker="o", ms=3, label="женщины")
+    ax.plot(share.index, share[1], color=MALE, lw=2, marker="o", ms=3, label="мужчины")
+    ax.set_xticks(range(0, 24, 2))
+    ax.set_xlabel("час операции")
+    ax.set_ylabel("доля операций, %")
+    ax.set_title("Время операций по полу (train, без 00:00:00)")
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    return fig
+
+
+def activity_by_gender(df: pd.DataFrame) -> plt.Figure:
+    """Распределение числа операций и активных дней на клиента по полу (train, лог-шкала)."""
+    from .data import client_activity, labels
+
+    act, g = client_activity(df), labels(df)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
+    for ax, col in zip(axes, ["операций", "активных дней"]):
+        v = np.log10(act[col])
+        _by_gender(ax, v, g, np.linspace(0, v.max(), 40))
+        ax.set_xlabel(f"{col} на клиента")
+        ticks = [t for t in (1, 10, 100, 1000, 10000) if np.log10(t) <= v.max()]
+        ax.set_xticks(np.log10(ticks), [str(t) for t in ticks])
+        ax.set_yticks([])
+        ax.set_title(f"{col.capitalize()} на клиента (train)")
+    axes[0].legend(frameon=False)
+    fig.tight_layout()
+    return fig
+
+
+def amounts_by_gender(df: pd.DataFrame) -> plt.Figure:
+    """log(1 + |amount|) по полу отдельно для расходов и поступлений (train, по операциям)."""
+    from .data import labels
+
+    g = labels(df)
+    gender = df["customer_id"].map(g)
+    la = np.log1p(df["amount"].abs())
+    bins = np.linspace(*la.quantile([0.0005, 0.9995]), 60)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.6), sharex=True)
+    for ax, mask, name in (
+        (axes[0], df["amount"] < 0, "Расходы"),
+        (axes[1], df["amount"] > 0, "Поступления"),
+    ):
+        for gv, color, lab in ((0, FEMALE, "женщины"), (1, MALE, "мужчины")):
+            ax.hist(
+                la[mask & (gender == gv)],
+                bins=bins,
+                density=True,
+                histtype="step",
+                lw=1.8,
+                color=color,
+                label=lab,
+            )
+        ax.set_title(f"{name} ({mask.mean():.0%} операций, train)")
+        ax.set_xlabel("log(1 + |amount|)")
+        ax.set_yticks([])
+    axes[0].legend(frameon=False)
+    fig.tight_layout()
+    return fig
+
+
+def mcc_coverage(df: pd.DataFrame) -> plt.Figure:
+    """Накопленная доля операций по MCC, отсортированным по частоте."""
+    from .data import mcc_coverage as coverage
+
+    c = coverage(df) * 100
+    k80, k95 = int((c < 80).sum() + 1), int((c < 95).sum() + 1)
+    fig, ax = plt.subplots(figsize=(7, 3.6))
+    ax.plot(np.arange(1, len(c) + 1), c.to_numpy(), color=MALE, lw=2)
+    for k, lvl in ((k80, 80), (k95, 95)):
+        ax.plot([k, k, 0], [0, lvl, lvl], color=ACCENT, lw=1, ls="--")
+        ax.text(k + 3, lvl - 6, f"{k} MCC — {lvl}% операций", color=ACCENT, fontsize=9)
+    ax.set_xscale("log")
+    ax.set_xlim(1, len(c))
+    ax.set_xticks([1, 3, 10, 30, 100], ["1", "3", "10", "30", "100"])
+    ax.set_ylim(0, 101)
+    ax.set_xlabel("число самых частых MCC (лог-шкала)")
+    ax.set_ylabel("доля операций, %")
+    ax.set_title(f"Покрытие операций кодами MCC (всего {len(c)}, train)")
+    fig.tight_layout()
+    return fig
+
+
+def group_signal(cfg: dict) -> plt.Figure:
+    """AUC LightGBM на каждой группе признаков отдельно (5-fold на train+val)."""
+    from .features import GROUP_PREFIXES
+
+    d = pd.read_csv(_results(cfg) / "group_signal.csv").sort_values("auc")
+    names = [GROUP_PREFIXES.get(g, "Все агрегаты вместе") for g in d["group"]]
+    fig, ax = plt.subplots(figsize=(8, 3.9))
+    colors = [ACCENT if g == "all" else GROUP_COLORS.get(g, NEUTRAL) for g in d["group"]]
+    ax.barh(
+        range(len(d)),
+        d["auc"],
+        xerr=d["auc_std"],
+        color=colors,
+        height=0.65,
+        error_kw={"ecolor": INK, "lw": 0.8, "capsize": 2},
+    )
+    ax.set_yticks(range(len(d)), [f"{n} ({k})" for n, k in zip(names, d["n_features"])])
+    for i, v in enumerate(d["auc"]):
+        ax.text(0.502, i, f"{v:.3f}", va="center", fontsize=8.5, color="white" if v > 0.6 else INK)
+    ax.set_xlim(0.5, 0.92)
+    ax.axvline(0.88, color=FEMALE, lw=1, ls="--")
+    ax.text(0.878, -0.45, "требование 0.88", color=FEMALE, fontsize=8, ha="right", va="center")
+    ax.set_xlabel("ROC AUC, 5 фолдов на train + val (в скобках — число признаков)")
+    ax.set_title("Сила сигнала групп признаков (LightGBM на одной группе)")
+    fig.tight_layout()
+    return fig
+
+
 def mcc_gender_skew(cfg: dict, top: int = 10) -> plt.Figure:
     """Diverging bar: MCC с наибольшим перекосом по полу (отклонение доли мужчин от средней, train)."""
     d = pd.read_csv(_results(cfg) / "mcc_gender_skew.csv")
     d = d.assign(delta=d["male_share"] - d["base"]).sort_values("delta")
     d = pd.concat([d.head(top), d.tail(top)])
+    # 95% интервал Уилсона для доли мужчин среди клиентов с этим MCC
+    z, n, p = 1.96, d["n_clients"], d["male_share"]
+    centre = (p + z**2 / (2 * n)) / (1 + z**2 / n)
+    half = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / (1 + z**2 / n)
+    lo, hi = (centre - half - d["base"]) * 100, (centre + half - d["base"]) * 100
     fig, ax = plt.subplots(figsize=(8.5, 6.2))
     colors = np.where(d["delta"] < 0, FEMALE, MALE)
     ax.barh(range(len(d)), d["delta"] * 100, color=colors, height=0.72)
+    x = d["delta"].to_numpy() * 100
+    ax.errorbar(
+        x,
+        range(len(d)),
+        xerr=[x - lo.to_numpy(), hi.to_numpy() - x],
+        fmt="none",
+        ecolor=INK,
+        lw=0.8,
+        capsize=2,
+    )
     ax.set_yticks(range(len(d)), [s if len(s) <= 46 else s[:44] + "…" for s in d["desc"]], fontsize=8.5)
     ax.axvline(0, color=INK, lw=0.8)
-    ax.set_xlabel("Доля мужчин среди клиентов с этим MCC минус средняя доля, п.п.")
+    ax.set_xlabel("Доля мужчин среди клиентов с этим MCC минус средняя, п.п. (95% CI)")
     ax.set_title("MCC с наибольшим перекосом по полу", pad=22)
     kw = dict(transform=ax.transAxes, fontsize=9, va="bottom")
     ax.text(0.0, 1.01, "← чаще женщины", color=FEMALE, **kw)
@@ -246,15 +423,31 @@ FIGURES = {
     "03_roc_test.png": roc_test,
     "04_feature_importance.png": feature_importance,
     "05_coles_umap.png": coles_umap,
+    "11_group_signal.png": group_signal,
+}
+# графики по сырым транзакциям train (нужен data/train.csv)
+DATA_FIGURES = {
+    "06_time_volume.png": time_volume,
+    "07_hourly_by_gender.png": hourly_by_gender,
+    "08_activity_by_gender.png": activity_by_gender,
+    "09_amounts_by_gender.png": amounts_by_gender,
+    "10_mcc_coverage.png": mcc_coverage,
 }
 
 
 def make_all(cfg: dict, show: bool = False) -> list[Path]:
+    from .data import load_split
+
     style()
+    train_csv = Path(cfg["paths"]["data"]) / "train.csv"
+    train = load_split("train", cfg["paths"]["data"]) if train_csv.exists() else None
+    jobs = [(name, lambda fn=fn: fn(cfg)) for name, fn in FIGURES.items()]
+    if train is not None:
+        jobs += [(name, lambda fn=fn: fn(train)) for name, fn in DATA_FIGURES.items()]
     saved = []
-    for name, fn in FIGURES.items():
+    for name, make in jobs:
         try:
-            fig = fn(cfg)
+            fig = make()
         except FileNotFoundError:
             continue
         if fig is None:

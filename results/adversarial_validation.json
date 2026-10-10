@@ -1,0 +1,13 @@
+{
+ "auc": 0.4950756195335277,
+ "auc_std": 0.01688718128204957,
+ "n_a": 5880,
+ "n_b": 1680,
+ "top_features": [
+  "dyn_ac_sum_l30",
+  "mcc_la_9",
+  "amt_in_la_skew",
+  "dyn_w30_out_la_mean",
+  "time_hour_8"
+ ]
+}

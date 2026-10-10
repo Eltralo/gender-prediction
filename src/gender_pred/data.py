@@ -1,4 +1,4 @@
-"""Загрузка данных, конфиг, подготовка транзакций и хранилище последовательностей."""
+"""Загрузка данных, конфиг, подготовка транзакций, хранилище последовательностей и анализ данных."""
 
 from __future__ import annotations
 
@@ -75,6 +75,65 @@ def labels(df: pd.DataFrame) -> pd.Series:
     return df.groupby("customer_id")["gender"].first().sort_index()
 
 
+# ---------------------------------------------------------------- обзор данных
+def split_overview(
+    splits: dict[str, pd.DataFrame], label_splits: tuple[str, ...] = ("train",)
+) -> pd.DataFrame:
+    """Строки, клиенты, период и баланс классов по сплитам; метки показываются только для ``label_splits``."""
+    rows = {}
+    for name, df in splits.items():
+        lab = labels(df) if name in label_splits else None
+        rows[name] = {
+            "строк": len(df),
+            "клиентов": df["customer_id"].nunique(),
+            "начало": df["tr_datetime"].min().date(),
+            "конец": df["tr_datetime"].max().date(),
+            "дней": (df["tr_datetime"].max() - df["tr_datetime"].min()).days + 1,
+            "доля мужчин": round(lab.mean(), 3) if lab is not None else "—",
+        }
+    return pd.DataFrame(rows).T
+
+
+def category_overview(df: pd.DataFrame) -> pd.Series:
+    """Число категорий и доли расходов / поступлений."""
+    term = df["term_id"].astype(str)
+    known = ~term.isin(["-1", "-1.0", "nan"])
+    return pd.Series(
+        {
+            "уникальных MCC": df["mcc_code"].nunique(),
+            "уникальных tr_type": df["tr_type"].nunique(),
+            "уникальных терминалов": term[known].nunique(),
+            "клиентов на терминал, медиана": int(
+                df.loc[known].groupby(term[known])["customer_id"].nunique().median()
+            ),
+            "доля операций без терминала": round(1 - known.mean(), 3),
+            "доля расходов (amount < 0)": round((df["amount"] < 0).mean(), 3),
+            "доля поступлений (amount > 0)": round((df["amount"] > 0).mean(), 3),
+        },
+        dtype=object,
+    )
+
+
+def data_quality(df: pd.DataFrame) -> pd.Series:
+    """Пропуски, дубликаты, нераспознанные даты, согласованность пола, выбросы сумм."""
+    a = df["amount"].abs()
+    p99, p999 = a.quantile([0.99, 0.999])
+    per_client = df.groupby("customer_id")["gender"].nunique() if "gender" in df else None
+    return pd.Series(
+        {
+            "строк": len(df),
+            "полных дубликатов строк": int(df.duplicated().sum()),
+            "нераспознанных дат (NaT)": int(df["tr_datetime"].isna().sum()),
+            "клиентов с > 1 значением пола": int((per_client > 1).sum()) if per_client is not None else "—",
+            "|amount|: 99-й перцентиль": round(p99, 2),
+            "|amount|: 99.9-й перцентиль": round(p999, 2),
+            "|amount|: максимум": round(a.max(), 2),
+            "доля операций с |amount| > 99.9-го перцентиля": round((a > p999).mean(), 4),
+        },
+        dtype=object,
+    )
+
+
 @dataclass
 class Vocab:
     """Словари категорий, фиксируемые по train: одинаковые колонки на любом сплите."""
@@ -140,3 +199,101 @@ class SequenceStore:
 
 
 SEQ_STORE = SequenceStore()
+
+
+# ---------------------------------------------------------------- анализ данных (раздел «Данные» ноутбука)
+def client_overlap(splits: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Число общих клиентов для каждой пары сплитов."""
+    ids = {k: set(v["customer_id"].unique()) for k, v in splits.items()}
+    return pd.DataFrame({a: {b: len(ids[a] & ids[b]) if a != b else len(ids[a]) for b in ids} for a in ids})
+
+
+def midnight_check(df: pd.DataFrame, top: int = 5) -> tuple[pd.Series, pd.DataFrame]:
+    """00:00:00 против соседних секунд; типы операций с наибольшей долей 00:00:00."""
+    sec = (df["tr_datetime"] - df["tr_datetime"].dt.normalize()).dt.total_seconds()
+    mid = sec == 0
+    summary = pd.Series(
+        {
+            "операций в 00:00:00": int(mid.sum()),
+            "в среднем за секунду 00:00:01–00:00:59": round(sec.between(1, 59).sum() / 59, 1),
+            "в среднем за секунду суток": round(len(sec) / 86400, 1),
+            "доля операций в 00:00:00": round(mid.mean(), 3),
+        },
+        dtype=object,
+    )
+    by_type = (
+        df.assign(mid=mid)
+        .groupby("tr_type")
+        .agg(desc=("tr_type_desc", "first"), операций=("mid", "size"), доля_00=("mid", "mean"))
+        .sort_values("операций", ascending=False)
+    )
+    by_type["доля всех 00:00:00"] = (by_type["операций"] * by_type["доля_00"]) / mid.sum()
+    return summary, by_type.sort_values("доля всех 00:00:00", ascending=False).head(top).round(3)
+
+
+def client_activity(df: pd.DataFrame) -> pd.DataFrame:
+    """На клиента: число операций, активных дней, длина истории в днях."""
+    day = (df["tr_datetime"] - T0).dt.days
+    g = day.groupby(df["customer_id"])
+    return pd.DataFrame(
+        {"операций": g.size(), "активных дней": g.nunique(), "длина истории, дней": g.max() - g.min() + 1}
+    )
+
+
+def amount_scale(df: pd.DataFrame) -> tuple[float, pd.Series]:
+    """Масштаб сумм: самая частая |amount| как единица и распределение |amount| в этих единицах."""
+    a = df["amount"].abs()
+    unit = float(a.mode().iloc[0])
+    r = a / unit
+    return unit, r.round(2).value_counts().head(12).rename("операций")
+
+
+def round_share(df: pd.DataFrame, unit: float, tol: float = 0.002) -> pd.Series:
+    """Доля операций клиента с целым числом единиц масштаба (index = customer_id)."""
+    r = df["amount"].abs() / unit
+    return (np.abs(r - np.round(r)) < tol).groupby(df["customer_id"]).mean()
+
+
+def mcc_coverage(df: pd.DataFrame) -> pd.Series:
+    """Накопленная доля операций по MCC, отсортированным по частоте."""
+    return df["mcc_code"].value_counts(normalize=True).cumsum().reset_index(drop=True)
+
+
+def mcc_trtype_link(df: pd.DataFrame) -> pd.Series:
+    """Насколько тип операции определяется MCC и наоборот."""
+    pair = df.groupby(["mcc_code", "tr_type"]).size()
+    return pd.Series(
+        {
+            "типов операций на MCC, медиана": int(df.groupby("mcc_code")["tr_type"].nunique().median()),
+            "MCC на тип операции, медиана": int(df.groupby("tr_type")["mcc_code"].nunique().median()),
+            "доля операций с основным типом своего MCC": round(
+                pair.groupby(level=0).max().sum() / len(df), 3
+            ),
+            "доля операций с основным MCC своего типа": round(pair.groupby(level=1).max().sum() / len(df), 3),
+        },
+        dtype=object,
+    )
+
+
+def terminal_overview(train: pd.DataFrame, test: pd.DataFrame) -> pd.Series:
+    """Клиентов на терминал (train) и пересечение терминалов train/test (без меток)."""
+
+    def known(df: pd.DataFrame) -> pd.DataFrame:
+        t = df["term_id"].astype(str)
+        return df.assign(term=t)[~t.isin(["-1", "-1.0", "nan"])]
+
+    tr, te = known(train), known(test)
+    per_term = tr.groupby("term")["customer_id"].nunique()
+    seen = te["term"].isin(set(tr["term"]))
+    return pd.Series(
+        {
+            "терминалов в train": len(per_term),
+            "клиентов на терминал, медиана": int(per_term.median()),
+            "доля терминалов с одним клиентом": round((per_term == 1).mean(), 3),
+            "доля операций test на терминалах из train": round(seen.mean(), 3),
+            "доля клиентов test с хотя бы одним терминалом из train": round(
+                te.loc[seen, "customer_id"].nunique() / test["customer_id"].nunique(), 3
+            ),
+        },
+        dtype=object,
+    )

@@ -403,6 +403,25 @@ class LabelFeatures:
         return self._apply(self.parts_, X, np.arange(len(X)))
 
 
+def feature_groups(X: pd.DataFrame, n_examples: int = 3) -> pd.DataFrame:
+    """Группа признаков -> число колонок -> примеры колонок (по префиксу имени)."""
+    prefix = X.columns.str.split("_").str[0]
+    rows = []
+    for p, name in GROUP_PREFIXES.items():
+        cols = X.columns[prefix == p]
+        if len(cols):
+            step = max(len(cols) // n_examples, 1)
+            rows.append(
+                {
+                    "группа": name,
+                    "префикс": f"{p}_",
+                    "признаков": len(cols),
+                    "примеры": ", ".join(cols[::step][:n_examples]),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def model_matrix(X: pd.DataFrame, label_feats: pd.DataFrame) -> pd.DataFrame:
     """Итоговая матрица для бустинга: признаки без меток + признаки с метками (без raw_/emb_)."""
     keep = ~X.columns.str.startswith(("raw_", "emb_"))

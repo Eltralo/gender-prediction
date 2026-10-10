@@ -53,6 +53,91 @@ def bootstrap_ci(
     }
 
 
+def _summary(name: str, rows: list[dict]) -> dict:
+    m = pd.DataFrame(rows)
+    return {
+        "model": name,
+        "auc": m["auc"].mean(),
+        "auc_std": m["auc"].std(ddof=1),
+        "accuracy": m["accuracy"].mean(),
+        "accuracy_std": m["accuracy"].std(ddof=1),
+    }
+
+
+def embedding_cv(X: pd.DataFrame, y: pd.Series, cfg: dict) -> dict:
+    """Эмбеддинг CoLES сам по себе: логрег (как признак lr_emb) на тех же фолдах CV."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    ids = np.sort(y.index.to_numpy())
+    E = X.loc[ids, X.columns.str.startswith("emb_")]
+    rows = []
+    for r in range(cfg["cv"]["repeats"]):
+        for tr, va in make_folds(ids, y, cfg, r):
+            clf = make_pipeline(
+                StandardScaler(),
+                LogisticRegression(C=cfg["features"]["embedding_logreg_C"], max_iter=3000),
+            ).fit(E.loc[tr], y[tr])
+            p = clf.predict_proba(E.loc[va])[:, 1]
+            rows.append(
+                {
+                    "auc": roc_auc_score(y[va], p),
+                    "accuracy": accuracy_score(y[va], p >= cfg["blend"]["threshold"]),
+                }
+            )
+    return _summary(f"Эмбеддинг CoLES ({E.shape[1]}), логрег", rows)
+
+
+UNLABELED_GROUPS = ("act", "amt", "mcc", "tt", "time", "term", "dyn")
+
+
+def group_signal(X: pd.DataFrame, y: pd.Series, cfg: dict, seed: int = 0) -> pd.DataFrame:
+    """AUC LightGBM на каждой группе признаков без меток отдельно и на всех вместе (5-fold, повтор 0)."""
+    ids = np.sort(y.index.to_numpy())
+    prefix = X.columns.str.split("_").str[0]
+    groups = {g: X.columns[prefix == g] for g in UNLABELED_GROUPS}
+    groups["all"] = X.columns[np.isin(prefix, UNLABELED_GROUPS)]
+    folds = make_folds(ids, y, cfg, 0)
+    rows = []
+    for g, cols in groups.items():
+        res = [
+            models.gbm_staged(X.loc[tr, cols], y[tr].to_numpy(), X.loc[va, cols], cfg, seed)
+            for tr, va in folds
+        ]
+        its = res[0][0]
+        curves = [np.array([roc_auc_score(y[va], p) for p in o[1]]) for o, (_, va) in zip(res, folds)]
+        rounds = models.nested_rounds(curves, its)
+        aucs = [c[list(its).index(n)] for c, n in zip(curves, rounds)]
+        rows.append(
+            {"group": g, "n_features": len(cols), "auc": np.mean(aucs), "auc_std": np.std(aucs, ddof=1)}
+        )
+    return pd.DataFrame(rows)
+
+
+def adversarial_auc(X_a: pd.DataFrame, X_b: pd.DataFrame, cfg: dict, seed: int = 0) -> dict:
+    """Adversarial validation: отличает ли LightGBM клиентов двух сплитов по признакам без меток."""
+    import lightgbm as lgb
+
+    cols = X_a.columns[np.isin(X_a.columns.str.split("_").str[0], UNLABELED_GROUPS)]
+    X = pd.concat([X_a[cols], X_b[cols]])
+    s = np.r_[np.zeros(len(X_a)), np.ones(len(X_b))]
+    params = dict(cfg["gbm"]["params"], seed=seed, num_threads=cfg["gbm"]["num_threads"])
+    aucs, imp = [], np.zeros(len(cols))
+    for tr, va in StratifiedKFold(5, shuffle=True, random_state=seed).split(X, s):
+        m = lgb.train(params, lgb.Dataset(X.iloc[tr], s[tr]), 500)
+        aucs.append(roc_auc_score(s[va], m.predict(X.iloc[va])))
+        imp += m.feature_importance("gain")
+    top = pd.Series(imp, index=cols).sort_values(ascending=False)
+    return {
+        "auc": float(np.mean(aucs)),
+        "auc_std": float(np.std(aucs, ddof=1)),
+        "n_a": len(X_a),
+        "n_b": len(X_b),
+        "top_features": list(top.index[:5]),
+    }
+
+
 @dataclass
 class GenderModel:
     """Ансамбль LightGBM, дообученного энкодера CoLES и TabPFN с калиброванным блендом."""
@@ -214,6 +299,21 @@ class GenderModel:
         df = pd.DataFrame(rows)
         df.loc[df.index[-1], "step"] = df["step"].iloc[-1] + " = итог"
         return df
+
+    def model_table(self, y: pd.Series) -> pd.DataFrame:
+        """Каждая модель отдельно (калибровка по остальным фолдам) и итоговый бленд: метрики по фолдам CV."""
+        repeats = sum(c.startswith("gbm_r") for c in self.oof_.columns)
+        names = {
+            "gbm_agg": "LightGBM, агрегаты",
+            "gbm": "LightGBM, агрегаты + признак CoLES",
+            "seq": "CoLES, дообученный на пол",
+            "tabpfn": "TabPFN v2, 300 признаков",
+        }
+        comps = [c for c in names if any(k.startswith(f"{c}_r") for k in self.oof_.columns)]
+        steps = [(names[c], [c]) for c in comps] + [("Бленд = итог", self.components)]
+        return pd.DataFrame(
+            [_summary(name, self._nested_blend_metrics(self.oof_, y, repeats, st)) for name, st in steps]
+        )
 
     # ------------------------------------------------------------ финальное обучение
     def fit_final(
