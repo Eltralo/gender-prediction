@@ -114,4 +114,5 @@ notebooks/pred_gen_tr.ipynb ноутбук задания: анализ данн
 environment.yml             окружение (GPU); environment-cpu.yml — без CUDA
 results/                    метрики CV и test, вклад компонентов, важности, анализ данных
 reports/figures/            графики
+artifacts/                  обученные модели — artifacts.zip в Release v1.0.0
 ```
