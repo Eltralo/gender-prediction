@@ -141,10 +141,6 @@ class LogitBlend:
     def predict_proba(self, Z: np.ndarray) -> np.ndarray:
         return self.final_.predict_proba((self._calibrated(Z) @ self.weights_)[:, None])[:, 1]
 
-    def component_proba(self, Z: np.ndarray) -> np.ndarray:
-        """Откалиброванные вероятности каждого компонента по отдельности."""
-        return 1 / (1 + np.exp(-self._calibrated(Z)))
-
     def describe(self, names: list[str]) -> pd.DataFrame:
         """Параметры калибровки (logit -> a·logit + b) и веса компонентов, итоговая калибровка."""
         rows = [

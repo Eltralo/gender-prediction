@@ -94,26 +94,6 @@ def split_overview(
     return pd.DataFrame(rows).T
 
 
-def category_overview(df: pd.DataFrame) -> pd.Series:
-    """Число категорий и доли расходов / поступлений."""
-    term = df["term_id"].astype(str)
-    known = ~term.isin(["-1", "-1.0", "nan"])
-    return pd.Series(
-        {
-            "уникальных MCC": df["mcc_code"].nunique(),
-            "уникальных tr_type": df["tr_type"].nunique(),
-            "уникальных терминалов": term[known].nunique(),
-            "клиентов на терминал, медиана": int(
-                df.loc[known].groupby(term[known])["customer_id"].nunique().median()
-            ),
-            "доля операций без терминала": round(1 - known.mean(), 3),
-            "доля расходов (amount < 0)": round((df["amount"] < 0).mean(), 3),
-            "доля поступлений (amount > 0)": round((df["amount"] > 0).mean(), 3),
-        },
-        dtype=object,
-    )
-
-
 def data_quality(df: pd.DataFrame) -> pd.Series:
     """Пропуски, дубликаты, нераспознанные даты, согласованность пола, выбросы сумм."""
     a = df["amount"].abs()
@@ -202,10 +182,6 @@ SEQ_STORE = SequenceStore()
 
 
 # ---------------------------------------------------------------- анализ данных (раздел «Данные» ноутбука)
-def client_overlap(splits: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Число общих клиентов для каждой пары сплитов."""
-    ids = {k: set(v["customer_id"].unique()) for k, v in splits.items()}
-    return pd.DataFrame({a: {b: len(ids[a] & ids[b]) if a != b else len(ids[a]) for b in ids} for a in ids})
 
 
 def midnight_check(df: pd.DataFrame, top: int = 5) -> tuple[pd.Series, pd.DataFrame]:
@@ -231,15 +207,6 @@ def midnight_check(df: pd.DataFrame, top: int = 5) -> tuple[pd.Series, pd.DataFr
     return summary, by_type.sort_values("доля всех 00:00:00", ascending=False).head(top).round(3)
 
 
-def client_activity(df: pd.DataFrame) -> pd.DataFrame:
-    """На клиента: число операций, активных дней, длина истории в днях."""
-    day = (df["tr_datetime"] - T0).dt.days
-    g = day.groupby(df["customer_id"])
-    return pd.DataFrame(
-        {"операций": g.size(), "активных дней": g.nunique(), "длина истории, дней": g.max() - g.min() + 1}
-    )
-
-
 def amount_scale(df: pd.DataFrame) -> tuple[float, pd.Series]:
     """Масштаб сумм: самая частая |amount| как единица и распределение |amount| в этих единицах."""
     a = df["amount"].abs()
@@ -252,27 +219,6 @@ def round_share(df: pd.DataFrame, unit: float, tol: float = 0.002) -> pd.Series:
     """Доля операций клиента с целым числом единиц масштаба (index = customer_id)."""
     r = df["amount"].abs() / unit
     return (np.abs(r - np.round(r)) < tol).groupby(df["customer_id"]).mean()
-
-
-def mcc_coverage(df: pd.DataFrame) -> pd.Series:
-    """Накопленная доля операций по MCC, отсортированным по частоте."""
-    return df["mcc_code"].value_counts(normalize=True).cumsum().reset_index(drop=True)
-
-
-def mcc_trtype_link(df: pd.DataFrame) -> pd.Series:
-    """Насколько тип операции определяется MCC и наоборот."""
-    pair = df.groupby(["mcc_code", "tr_type"]).size()
-    return pd.Series(
-        {
-            "типов операций на MCC, медиана": int(df.groupby("mcc_code")["tr_type"].nunique().median()),
-            "MCC на тип операции, медиана": int(df.groupby("tr_type")["mcc_code"].nunique().median()),
-            "доля операций с основным типом своего MCC": round(
-                pair.groupby(level=0).max().sum() / len(df), 3
-            ),
-            "доля операций с основным MCC своего типа": round(pair.groupby(level=1).max().sum() / len(df), 3),
-        },
-        dtype=object,
-    )
 
 
 def terminal_overview(train: pd.DataFrame, test: pd.DataFrame) -> pd.Series:
@@ -297,20 +243,3 @@ def terminal_overview(train: pd.DataFrame, test: pd.DataFrame) -> pd.Series:
         },
         dtype=object,
     )
-
-
-def mcc_gender_lift(df: pd.DataFrame, min_clients: int = 200, z: float = 1.96) -> pd.DataFrame:
-    """Lift MCC: доля мужчин, пользующихся MCC, к доле женщин (отношение рисков) с 95% CI (только train)."""
-    g = labels(df)
-    users = df[df["amount"] < 0].groupby(["customer_id", "mcc_code"]).size().unstack(fill_value=0) > 0
-    users = users.reindex(g.index, fill_value=False)
-    n_m, n_f = int((g == 1).sum()), int((g == 0).sum())
-    a, b = users[g == 1].sum(), users[g == 0].sum()
-    d = pd.DataFrame({"n_clients": a + b, "p_m": a / n_m, "p_f": b / n_f})
-    d = d[(d["n_clients"] >= min_clients) & (a > 0) & (b > 0)]
-    a, b = a[d.index], b[d.index]
-    d["lift"] = d["p_m"] / d["p_f"]
-    se = np.sqrt(1 / a - 1 / n_m + 1 / b - 1 / n_f)
-    d["lo"], d["hi"] = d["lift"] * np.exp(-z * se), d["lift"] * np.exp(z * se)
-    desc = df.drop_duplicates("mcc_code").set_index("mcc_code")["mcc_code_desc"].astype(str)
-    return d.assign(desc=desc.reindex(d.index)).sort_values("lift")

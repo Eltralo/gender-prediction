@@ -95,18 +95,6 @@ def training_matrix(X: pd.DataFrame, y: pd.Series, cfg: dict) -> tuple[LabelFeat
     return lf, model_matrix(X, lf.fit_transform(X, y))
 
 
-def pick_examples(y: pd.Series, proba: pd.Series) -> dict[str, int]:
-    """Клиенты для демонстрации: уверенно верные (женщина, мужчина), самый неуверенный, уверенная ошибка."""
-    p = proba.reindex(y.index)
-    wrong = (p >= 0.5).astype(int) != y
-    return {
-        "уверенно верно: женщина": int(p[(y == 0) & ~wrong].idxmin()),
-        "уверенно верно: мужчина": int(p[(y == 1) & ~wrong].idxmax()),
-        "неуверенно": int((p - 0.5).abs().idxmin()),
-        "ошибка": int((p - 0.5).abs()[wrong].idxmax()),
-    }
-
-
 UNLABELED_GROUPS = ("act", "amt", "mcc", "tt", "time", "term", "dyn")
 
 
@@ -436,17 +424,6 @@ class GenderModel:
     def predict_proba(self, X: pd.DataFrame, seqs: sequence.Sequences | None) -> np.ndarray:
         return self.blend_.predict_proba(self.component_logits(X, seqs).to_numpy())
 
-    def explain(self, X: pd.DataFrame, seqs: sequence.Sequences | None) -> pd.DataFrame:
-        """Вероятность «мужчина» у каждой модели (после калибровки) и у бленда."""
-        Z = self.component_logits(X, seqs).to_numpy()
-        P = pd.DataFrame(self.blend_.component_proba(Z), index=X.index, columns=self.components)
-        return P.assign(blend=self.blend_.predict_proba(Z))
-
-    def gbm_contributions(self, M: pd.DataFrame) -> pd.DataFrame:
-        """Вклад признаков матрицы ``M`` в логит LightGBM (pred_contrib, TreeSHAP); ``bias`` — база."""
-        C = np.mean([m.predict(M[self.columns_], pred_contrib=True) for m in self.gbm_], 0)
-        return pd.DataFrame(C, index=M.index, columns=[*self.columns_, "bias"])
-
     # ------------------------------------------------------------ сохранение
     def save(self, path: str | Path) -> None:
         path = Path(path)
@@ -588,3 +565,102 @@ def model_summary(results: str | Path) -> pd.DataFrame:
             for name, what, on, r, verdict in rows
         ]
     ).set_index("модель")
+
+
+def hyperparameter_table(cfg: dict) -> pd.DataFrame:
+    """Гиперпараметры всех моделей из конфига: модель, параметр, значение, как выбран."""
+    g, e = cfg["gbm"], cfg["sequence"]["encoder"]
+    gp = g["params"]
+    p, f, t, b = cfg["sequence"]["pretrain"], cfg["sequence"]["finetune"], cfg["tabpfn"], cfg["blend"]
+    fixed, ref = "фиксировано (Optuna не улучшил)", "эталонный конфиг CoLES (ptls-experiments)"
+    rows = [
+        (
+            "LightGBM",
+            "learning_rate / num_leaves / min_child_samples",
+            f"{gp['learning_rate']} / {gp['num_leaves']} / {gp['min_child_samples']}",
+            fixed,
+        ),
+        (
+            "LightGBM",
+            "feature_fraction / bagging_fraction / lambda_l2",
+            f"{gp['feature_fraction']} / {gp['bagging_fraction']} / {gp['lambda_l2']}",
+            fixed,
+        ),
+        (
+            "LightGBM",
+            "число деревьев",
+            f"≤ {g['max_rounds']}, сетка шагом {g['eval_step']}",
+            "вложенно: максимум средней AUC-кривой остальных фолдов",
+        ),
+        (
+            "LightGBM",
+            "деревьев в финальной модели",
+            f"среднее по фолдам × {g['final_rounds_scale']}",
+            "поправка на 25% больше данных",
+        ),
+        (
+            "CoLES, энкодер",
+            "GRU hidden / MCC emb / tr_type emb",
+            f"{e['hidden']} / {e['mcc_dim']} / {e['tr_type_dim']}",
+            ref,
+        ),
+        ("CoLES, энкодер", "шум эмбеддингов категорий", e["emb_noise"], ref),
+        ("CoLES, предобучение", "оптимизатор, lr", f"Adam, {p['lr']}", ref),
+        ("CoLES, предобучение", "шедулер", f"StepLR: каждые {p['step_size']} эпох × {p['gamma']}", ref),
+        (
+            "CoLES, предобучение",
+            "эпох / батч клиентов",
+            f"{p['epochs']} / {p['batch_size']}",
+            "эпохи — по плато качества эмбеддинга",
+        ),
+        (
+            "CoLES, предобучение",
+            "срезов на клиента / длина среза",
+            f"{p['n_slices']} / {p['slice_min']}–{p['slice_max']} операций",
+            ref,
+        ),
+        (
+            "CoLES, предобучение",
+            "loss",
+            f"контрастная: margin {p['margin']}, {p['neg_count']} трудных негативов на якорь",
+            ref,
+        ),
+        ("CoLES, предобучение", "dropout транзакций", p["trx_dropout"], ref),
+        (
+            "CoLES, дообучение",
+            "lr энкодера / головы",
+            f"{f['lr_encoder']} / {f['lr_head']} (Adam)",
+            "по CV на train + val",
+        ),
+        (
+            "CoLES, дообучение",
+            "шедулер / эпох / батч",
+            f"StepLR: каждую эпоху × {f['gamma']} / {f['epochs']} / {f['batch_size']}",
+            "по CV на train + val",
+        ),
+        (
+            "CoLES, дообучение",
+            "длина среза / история при предсказании",
+            f"{f['slice_min']}–{f['slice_max']} / последние {f['predict_max_len']} операций",
+            "по CV на train + val",
+        ),
+        ("CoLES, дообучение", "dropout транзакций", f["trx_dropout"], ref),
+        (
+            "TabPFN v2",
+            "признаков",
+            f"{t['top_k']}, отбор по gain LightGBM внутри обучения",
+            "лимит TabPFN на число признаков",
+        ),
+        ("TabPFN v2", "ансамблей (n_estimators)", t["n_estimators"], "по умолчанию"),
+        ("Бленд", "калибровка", "Platt для каждой модели и итоговый", "по out-of-fold предсказаниям"),
+        (
+            "Бленд",
+            "веса",
+            f"симплекс, шаг {b['weight_step']}, максимум AUC",
+            "по OOF; на CV — по остальным фолдам",
+        ),
+        ("Бленд", "порог", b["threshold"], "калиброванные вероятности, без подбора"),
+    ]
+    return pd.DataFrame(rows, columns=["модель", "параметр", "значение", "как выбран"]).set_index(
+        ["модель", "параметр"]
+    )
