@@ -89,6 +89,24 @@ def embedding_cv(X: pd.DataFrame, y: pd.Series, cfg: dict) -> dict:
     return _summary(f"Эмбеддинг CoLES ({E.shape[1]}), логрег", rows)
 
 
+def training_matrix(X: pd.DataFrame, y: pd.Series, cfg: dict) -> tuple[LabelFeatures, pd.DataFrame]:
+    """Матрица, на которой учатся финальные табличные модели: признаки с метками — out-of-fold."""
+    lf = LabelFeatures(cfg["features"], seed=cfg["seed"], n_inner=cfg["cv"]["inner_splits"])
+    return lf, model_matrix(X, lf.fit_transform(X, y))
+
+
+def pick_examples(y: pd.Series, proba: pd.Series) -> dict[str, int]:
+    """Клиенты для демонстрации: уверенно верные (женщина, мужчина), самый неуверенный, уверенная ошибка."""
+    p = proba.reindex(y.index)
+    wrong = (p >= 0.5).astype(int) != y
+    return {
+        "уверенно верно: женщина": int(p[(y == 0) & ~wrong].idxmin()),
+        "уверенно верно: мужчина": int(p[(y == 1) & ~wrong].idxmax()),
+        "неуверенно": int((p - 0.5).abs().idxmin()),
+        "ошибка": int((p - 0.5).abs()[wrong].idxmax()),
+    }
+
+
 UNLABELED_GROUPS = ("act", "amt", "mcc", "tt", "time", "term", "dyn")
 
 
@@ -376,10 +394,7 @@ class GenderModel:
         ids = np.sort(y.index.to_numpy())
         Z = self.oof_[[f"{c}_r0" for c in self.components]].to_numpy()
         self.blend_ = models.LogitBlend(self.cfg["blend"]["weight_step"]).fit(Z, y.reindex(ids).to_numpy())
-        self.label_features_ = LabelFeatures(
-            self.cfg["features"], seed=self.cfg["seed"], n_inner=self.cfg["cv"]["inner_splits"]
-        )
-        M = model_matrix(X.loc[ids], self.label_features_.fit_transform(X.loc[ids], y))
+        self.label_features_, M = training_matrix(X.loc[ids], y, self.cfg)
         self.columns_ = list(M.columns)
         yv = y.reindex(ids).to_numpy()
         if "gbm" in self.components:
@@ -394,8 +409,12 @@ class GenderModel:
             ]
         return self
 
+    def matrix(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Матрица табличных моделей: признаки без меток + признаки с метками по статистикам обучения."""
+        return model_matrix(X, self.label_features_.transform(X))[self.columns_]
+
     def component_logits(self, X: pd.DataFrame, seqs: sequence.Sequences | None) -> pd.DataFrame:
-        M = model_matrix(X, self.label_features_.transform(X))[self.columns_]
+        M = self.matrix(X)
         out = {}
         if "gbm" in self.components:
             out["gbm"] = models.to_logit(np.mean([m.predict(M) for m in self.gbm_], 0))
@@ -416,6 +435,17 @@ class GenderModel:
 
     def predict_proba(self, X: pd.DataFrame, seqs: sequence.Sequences | None) -> np.ndarray:
         return self.blend_.predict_proba(self.component_logits(X, seqs).to_numpy())
+
+    def explain(self, X: pd.DataFrame, seqs: sequence.Sequences | None) -> pd.DataFrame:
+        """Вероятность «мужчина» у каждой модели (после калибровки) и у бленда."""
+        Z = self.component_logits(X, seqs).to_numpy()
+        P = pd.DataFrame(self.blend_.component_proba(Z), index=X.index, columns=self.components)
+        return P.assign(blend=self.blend_.predict_proba(Z))
+
+    def gbm_contributions(self, M: pd.DataFrame) -> pd.DataFrame:
+        """Вклад признаков матрицы ``M`` в логит LightGBM (pred_contrib, TreeSHAP); ``bias`` — база."""
+        C = np.mean([m.predict(M[self.columns_], pred_contrib=True) for m in self.gbm_], 0)
+        return pd.DataFrame(C, index=M.index, columns=[*self.columns_, "bias"])
 
     # ------------------------------------------------------------ сохранение
     def save(self, path: str | Path) -> None:

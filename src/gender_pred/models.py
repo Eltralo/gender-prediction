@@ -141,6 +141,19 @@ class LogitBlend:
     def predict_proba(self, Z: np.ndarray) -> np.ndarray:
         return self.final_.predict_proba((self._calibrated(Z) @ self.weights_)[:, None])[:, 1]
 
+    def component_proba(self, Z: np.ndarray) -> np.ndarray:
+        """Откалиброванные вероятности каждого компонента по отдельности."""
+        return 1 / (1 + np.exp(-self._calibrated(Z)))
+
+    def describe(self, names: list[str]) -> pd.DataFrame:
+        """Параметры калибровки (logit -> a·logit + b) и веса компонентов, итоговая калибровка."""
+        rows = [
+            {"шаг": f"Platt: {n}", "a": p.coef_[0, 0], "b": p.intercept_[0], "вес": w}
+            for n, p, w in zip(names, self.platt_, self.weights_)
+        ]
+        rows.append({"шаг": "итоговый Platt", "a": self.final_.coef_[0, 0], "b": self.final_.intercept_[0]})
+        return pd.DataFrame(rows).set_index("шаг")
+
     def to_dict(self) -> dict:
         return {
             "weights": self.weights_.tolist(),

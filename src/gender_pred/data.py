@@ -297,3 +297,20 @@ def terminal_overview(train: pd.DataFrame, test: pd.DataFrame) -> pd.Series:
         },
         dtype=object,
     )
+
+
+def mcc_gender_lift(df: pd.DataFrame, min_clients: int = 200, z: float = 1.96) -> pd.DataFrame:
+    """Lift MCC: доля мужчин, пользующихся MCC, к доле женщин (отношение рисков) с 95% CI (только train)."""
+    g = labels(df)
+    users = df[df["amount"] < 0].groupby(["customer_id", "mcc_code"]).size().unstack(fill_value=0) > 0
+    users = users.reindex(g.index, fill_value=False)
+    n_m, n_f = int((g == 1).sum()), int((g == 0).sum())
+    a, b = users[g == 1].sum(), users[g == 0].sum()
+    d = pd.DataFrame({"n_clients": a + b, "p_m": a / n_m, "p_f": b / n_f})
+    d = d[(d["n_clients"] >= min_clients) & (a > 0) & (b > 0)]
+    a, b = a[d.index], b[d.index]
+    d["lift"] = d["p_m"] / d["p_f"]
+    se = np.sqrt(1 / a - 1 / n_m + 1 / b - 1 / n_f)
+    d["lo"], d["hi"] = d["lift"] * np.exp(-z * se), d["lift"] * np.exp(z * se)
+    desc = df.drop_duplicates("mcc_code").set_index("mcc_code")["mcc_code_desc"].astype(str)
+    return d.assign(desc=desc.reindex(d.index)).sort_values("lift")
