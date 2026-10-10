@@ -53,6 +53,16 @@ def style() -> None:
     )
 
 
+def table(df: pd.DataFrame, precision: int = 3):
+    """Таблица для ноутбука: выравнивание влево (заголовки и ячейки), фиксированная точность чисел."""
+    left = [("text-align", "left")]
+    return (
+        df.style.format(precision=precision, na_rep="—")
+        .set_properties(**{"text-align": "left"})
+        .set_table_styles([{"selector": "th", "props": left}, {"selector": "td", "props": left}])
+    )
+
+
 def _save(fig: plt.Figure, cfg: dict, name: str) -> Path:
     out = Path(cfg["paths"]["figures"])
     out.mkdir(parents=True, exist_ok=True)
