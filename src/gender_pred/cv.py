@@ -315,6 +315,59 @@ class GenderModel:
             [_summary(name, self._nested_blend_metrics(self.oof_, y, repeats, st)) for name, st in steps]
         )
 
+    def compare_boosters(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
+        """XGBoost и CatBoost на той же матрице (агрегаты + признаки с метками), тех же фолдах и с тем же
+        вложенным выбором итераций, что LightGBM; метрики, парное сравнение с LightGBM и бленд с ними."""
+        ids = np.sort(y.index.to_numpy())
+        repeats = sum(c.startswith("gbm_r") for c in self.oof_.columns)
+        staged = {"xgb": models.xgb_staged, "cat": models.cat_staged}
+        cols: dict[str, pd.Series] = {}
+        for r in range(repeats):
+            folds = make_folds(ids, y, self.cfg, r)
+            res = {name: [] for name in staged}
+            for k, (tr, va) in enumerate(folds):
+                lf = LabelFeatures(
+                    self.cfg["features"], seed=r * 10 + k, n_inner=self.cfg["cv"]["inner_splits"]
+                )
+                M_tr = model_matrix(X.loc[tr], lf.fit_transform(X.loc[tr], y))
+                M_va = model_matrix(X.loc[va], lf.transform(X.loc[va]))
+                for name, fn in staged.items():
+                    res[name].append(fn(M_tr, y[tr].to_numpy(), M_va, self.cfg, r * 10 + k))
+                self._print(f"  comparison repeat {r} fold {k} done")
+            for name, out in res.items():
+                its = out[0][0]
+                curves = [np.array([roc_auc_score(y[va], p) for p in o[1]]) for o, (_, va) in zip(out, folds)]
+                rounds = models.nested_rounds(curves, its)
+                cols[f"{name}_r{r}"] = pd.concat(
+                    [
+                        pd.Series(models.to_logit(o[1][list(its).index(n)]), index=va)
+                        for o, n, (_, va) in zip(out, rounds, folds)
+                    ]
+                )
+        oof = pd.concat([self.oof_, pd.DataFrame(cols).reindex(self.oof_.index)], axis=1)
+        base = pd.DataFrame(self._nested_blend_metrics(oof, y, repeats, ["gbm"]))
+        final = pd.DataFrame(self._nested_blend_metrics(oof, y, repeats, self.components))
+        rows = []
+        for name in staged:
+            m = pd.DataFrame(self._nested_blend_metrics(oof, y, repeats, [name]))
+            b = pd.DataFrame(self._nested_blend_metrics(oof, y, repeats, [*self.components, name]))
+            d, db = m["auc"] - base["auc"], b["auc"] - final["auc"]
+            rows.append(
+                {
+                    **_summary(name, m.to_dict("records")),
+                    "delta_vs_lgb": d.mean(),
+                    "delta_vs_lgb_std": d.std(ddof=1),
+                    "folds_better_than_lgb": int((d > 0).sum()),
+                    "blend_with_auc": b["auc"].mean(),
+                    "blend_with_delta": db.mean(),
+                    "blend_with_delta_std": db.std(ddof=1),
+                    "blend_with_folds_better": int((db > 0).sum()),
+                    "n_folds": len(d),
+                }
+            )
+        self.comparison_oof_ = oof[list(cols)]
+        return pd.DataFrame(rows)
+
     # ------------------------------------------------------------ финальное обучение
     def fit_final(
         self, X: pd.DataFrame, y: pd.Series, seqs: sequence.Sequences | None, encoder_state: dict | None
@@ -420,3 +473,88 @@ def save_vocab(vocab: Vocab, path: str | Path) -> None:
 
 def load_vocab(path: str | Path) -> Vocab:
     return Vocab(**json.loads(Path(path).read_text()))
+
+
+def model_summary(results: str | Path) -> pd.DataFrame:
+    """Сводная таблица всех моделей из results/: описание, данные, метрики CV, решение о финале."""
+    res = Path(results)
+    meta = json.loads((res / "cv_metrics.json").read_text())
+    weights = dict(zip(meta["components"], meta["blend_weights"]))
+    m = pd.read_csv(res / "cv_models.csv").set_index("model")
+    cmp = pd.read_csv(res / "model_comparison.csv").set_index("model")
+
+    def fmt(mean: float, std: float) -> str:
+        return f"{mean:.4f} ± {std:.4f}"
+
+    def rejected(name: str) -> str:
+        r = cmp.loc[name]
+        n, better = int(r["n_folds"]), int(r["folds_better_than_lgb"])
+        vs = (
+            f"AUC {r['delta_vs_lgb']:+.4f} ± {r['delta_vs_lgb_std']:.4f} к LightGBM, "
+            f"лучше в {better}/{n} фолдов"
+        )
+        if better == 0:
+            return f"нет: хуже LightGBM ({vs}); в бленде вес 0"
+        return (
+            f"нет: вровень с LightGBM ({vs}); прирост в бленде {r['blend_with_delta']:+.5f} ± "
+            f"{r['blend_with_delta_std']:.4f} AUC — в пределах шума, "
+            "оставили одну модель бустинга ради простоты"
+        )
+
+    rows = [
+        (
+            "LightGBM",
+            "градиентный бустинг, основная модель",
+            "агрегаты клиента + признаки с метками (OOF), в т. ч. логрег по эмбеддингу CoLES",
+            m.loc["LightGBM, агрегаты + признак CoLES"],
+            f"да, вес {weights['gbm']:.2f}",
+        ),
+        (
+            "TabPFN v2",
+            "предобученный трансформер для таблиц, предсказывает без обучения деревьев",
+            "300 признаков, отобранных по gain LightGBM внутри обучения",
+            m.loc["TabPFN v2, 300 признаков"],
+            f"да, вес {weights['tabpfn']:.2f}",
+        ),
+        (
+            "CoLES, дообученный",
+            "GRU-энкодер, предобученный контрастно без меток, + голова на пол",
+            "последовательность последних 1 200 транзакций клиента",
+            m.loc["CoLES, дообученный на пол"],
+            f"да, вес {weights['seq']:.2f}",
+        ),
+        (
+            "XGBoost",
+            "градиентный бустинг",
+            "та же матрица и те же фолды, что у LightGBM",
+            cmp.loc["xgb"],
+            rejected("xgb"),
+        ),
+        (
+            "CatBoost",
+            "градиентный бустинг (симметричные деревья)",
+            "та же матрица и те же фолды, что у LightGBM",
+            cmp.loc["cat"],
+            rejected("cat"),
+        ),
+        (
+            "Бленд = итог",
+            "калиброванная взвешенная сумма логитов трёх моделей",
+            "out-of-fold предсказания LightGBM, TabPFN и CoLES",
+            m.loc["Бленд = итог"],
+            "итог, порог 0.5",
+        ),
+    ]
+    return pd.DataFrame(
+        [
+            {
+                "модель": name,
+                "что это": what,
+                "на чём учится": on,
+                "CV ROC AUC": fmt(r["auc"], r["auc_std"]),
+                "CV accuracy": fmt(r["accuracy"], r["accuracy_std"]),
+                "в финале": verdict,
+            }
+            for name, what, on, r, verdict in rows
+        ]
+    ).set_index("модель")

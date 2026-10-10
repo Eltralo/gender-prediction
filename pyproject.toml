@@ -24,6 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tabpfn = ["tabpfn>=2.0"]
+compare = ["xgboost>=2.0", "catboost>=1.2"]
 dev = ["ruff>=0.6", "jupyter", "ipykernel", "nbconvert"]
 
 [project.scripts]

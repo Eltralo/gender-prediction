@@ -14,6 +14,8 @@ dependencies:
       - scipy==1.17.1
       - scikit-learn==1.9.1
       - lightgbm==4.7.0
+      - xgboost==3.2.0
+      - catboost==1.2.10
       - tabpfn==9.1.0
       - matplotlib==3.11.2
       - pyyaml==6.0.3

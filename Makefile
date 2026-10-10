@@ -8,12 +8,12 @@ PY ?= conda run --no-capture-output -n $(ENV) python
 setup:  ## новая conda-среда $(ENV) из $(ENV_FILE) + пакет; существующую среду не трогает
 	@if conda env list | awk '{print $$1}' | grep -qx "$(ENV)"; then \
 		echo "Среда '$(ENV)' уже существует — setup её не изменяет."; \
-		echo "  обновить явно:   conda env update -n $(ENV) -f $(ENV_FILE) && conda run -n $(ENV) pip install -e '.[tabpfn,dev]'"; \
+		echo "  обновить явно:   conda env update -n $(ENV) -f $(ENV_FILE) && conda run -n $(ENV) pip install -e '.[tabpfn,compare,dev]'"; \
 		echo "  или другое имя:  make setup ENV=<имя>"; \
 		exit 1; \
 	fi
 	conda env create -n $(ENV) -f $(ENV_FILE)
-	conda run -n $(ENV) pip install -e ".[tabpfn,dev]"
+	conda run -n $(ENV) pip install -e ".[tabpfn,compare,dev]"
 
 train:  ## данные, предобучение CoLES, кросс-валидация, финальные модели -> artifacts/, results/
 	$(PY) -m gender_pred.cli train --config $(CONFIG)

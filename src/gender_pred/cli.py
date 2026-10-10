@@ -220,6 +220,8 @@ def train(cfg: dict, ctx: Context | None = None, splits: dict | None = None) -> 
     model.save(ctx.artifacts / "model")
     write_cv_results(cfg, model, y)
     write_model_table(cfg, model, X, y)
+    if cfg.get("comparison", {}).get("enabled"):
+        write_comparison(cfg, model, X, y)
     write_descriptive_results(cfg, model, splits["train"])
     write_data_results(cfg, X, y, ctx.features(splits["train"]), ctx.features(splits["test"]))
     return model
@@ -344,6 +346,13 @@ def write_model_table(cfg: dict, model: cv.GenderModel, X: pd.DataFrame, y: pd.S
     t = model.model_table(y)
     t = pd.concat([pd.DataFrame([cv.embedding_cv(X, y, cfg)]), t], ignore_index=True)
     t.to_csv(Path(cfg["paths"]["results"]) / "cv_models.csv", index=False)
+    return t
+
+
+def write_comparison(cfg: dict, model: cv.GenderModel, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
+    """XGBoost и CatBoost против LightGBM и в бленде -> results/model_comparison.csv."""
+    t = model.compare_boosters(X, y)
+    t.to_csv(Path(cfg["paths"]["results"]) / "model_comparison.csv", index=False)
     return t
 
 

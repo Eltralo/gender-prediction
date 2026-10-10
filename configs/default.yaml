@@ -94,6 +94,25 @@ tabpfn:
   top_k: 300
   n_estimators: 8
 
+# Сравнение с другими бустингами на той же матрице и тех же фолдах, что LightGBM (в финал не входят)
+comparison:
+  enabled: true
+  xgboost:
+    objective: binary:logistic
+    eta: 0.02
+    max_depth: 4
+    min_child_weight: 5
+    subsample: 0.8
+    colsample_bytree: 0.25
+    reg_lambda: 10.0
+    tree_method: hist
+  catboost:
+    learning_rate: 0.03
+    depth: 6
+    l2_leaf_reg: 5
+    rsm: 0.25
+  max_rounds: {xgboost: 3000, catboost: 4000}
+
 blend:
   components: [gbm, seq, tabpfn]
   weight_step: 0.05

@@ -23,6 +23,38 @@ def gbm_staged(
     return its, np.stack([model.predict(X_va, num_iteration=int(i)) for i in its])
 
 
+def xgb_staged(
+    X_tr: pd.DataFrame, y_tr: np.ndarray, X_va: pd.DataFrame, cfg: dict, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """XGBoost для сравнения: сетка итераций и предсказания на ней (как ``gbm_staged``)."""
+    import xgboost as xgb
+
+    c, step = cfg["comparison"], cfg["gbm"]["eval_step"]
+    params = dict(c["xgboost"], seed=seed, nthread=cfg["gbm"]["num_threads"])
+    model = xgb.train(params, xgb.DMatrix(X_tr, y_tr), c["max_rounds"]["xgboost"])
+    its = np.arange(step, c["max_rounds"]["xgboost"] + 1, step)
+    dva = xgb.DMatrix(X_va)
+    return its, np.stack([model.predict(dva, iteration_range=(0, int(i))) for i in its])
+
+
+def cat_staged(
+    X_tr: pd.DataFrame, y_tr: np.ndarray, X_va: pd.DataFrame, cfg: dict, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """CatBoost для сравнения: сетка итераций и предсказания на ней (как ``gbm_staged``)."""
+    from catboost import CatBoostClassifier
+
+    c, step = cfg["comparison"], cfg["gbm"]["eval_step"]
+    model = CatBoostClassifier(
+        iterations=c["max_rounds"]["catboost"],
+        thread_count=cfg["gbm"]["num_threads"],
+        random_seed=seed,
+        verbose=0,
+        **c["catboost"],
+    ).fit(X_tr, y_tr)
+    preds = [q[:, 1] for q in model.staged_predict_proba(X_va, eval_period=step)]
+    return np.arange(step, step * len(preds) + 1, step), np.stack(preds)
+
+
 def gbm_fit(X: pd.DataFrame, y: np.ndarray, rounds: int, cfg: dict, seed: int) -> lgb.Booster:
     g = cfg["gbm"]
     params = dict(g["params"], seed=seed, num_threads=g["num_threads"])
