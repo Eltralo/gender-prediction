@@ -26,8 +26,11 @@ from .features import LabelFeatures, model_matrix
 
 
 def make_folds(ids: np.ndarray, y: pd.Series, cfg: dict, repeat: int) -> list[tuple[np.ndarray, np.ndarray]]:
+    # 5 фолдов по клиентам, стратифицированно по полу: в каждом фолде та же доля мужчин (~44%).
+    # Повтор r — другое случайное разбиение (сид fold_seed + r); 2 повтора × 5 фолдов = 10 оценок
     c = cfg["cv"]
     skf = StratifiedKFold(c["n_splits"], shuffle=True, random_state=c["fold_seed"] + repeat)
+    # пары (обучающие клиенты, валидационные клиенты) в виде customer_id
     return [(ids[a], ids[b]) for a, b in skf.split(ids, y.reindex(ids).to_numpy())]
 
 
@@ -37,14 +40,19 @@ def bootstrap_ci(
     """Точечные AUC / accuracy и перцентильные bootstrap-интервалы."""
     rng = np.random.default_rng(seed)
     aucs, accs = [], []
+    # n = 2000 повторов: каждый раз перевыбираем клиентов test с возвращением (тот же размер выборки)
+    # и пересчитываем метрики — получаем распределение метрики на «похожих» выборках
     for _ in range(n):
         i = rng.integers(0, len(y), len(y))
+        # в выборке оказался только один класс — AUC не определён, повтор пропускаем
         if y[i].min() == y[i].max():
             continue
         aucs.append(roc_auc_score(y[i], p[i]))
         accs.append(accuracy_score(y[i], p[i] >= threshold))
+    # перцентили 2.5 и 97.5 этого распределения — границы 95% доверительного интервала
     q = [(1 - level) / 2 * 100, (1 + level) / 2 * 100]
     return {
+        # точечные метрики — по всей выборке без перевыбора
         "auc": float(roc_auc_score(y, p)),
         "auc_ci": [float(v) for v in np.percentile(aucs, q)],
         "accuracy": float(accuracy_score(y, p >= threshold)),
@@ -54,6 +62,7 @@ def bootstrap_ci(
 
 
 def _summary(name: str, rows: list[dict]) -> dict:
+    # метрики по фолдам → среднее и стандартное отклонение между фолдами
     m = pd.DataFrame(rows)
     return {
         "model": name,
@@ -71,14 +80,17 @@ def embedding_cv(X: pd.DataFrame, y: pd.Series, cfg: dict) -> dict:
     from sklearn.preprocessing import StandardScaler
 
     ids = np.sort(y.index.to_numpy())
+    # только колонки эмбеддинга emb_0 … emb_1023
     E = X.loc[ids, X.columns.str.startswith("emb_")]
     rows = []
     for r in range(cfg["cv"]["repeats"]):
         for tr, va in make_folds(ids, y, cfg, r):
+            # логрег учится на обучающих клиентах фолда и оценивается на валидационных
             clf = make_pipeline(
                 StandardScaler(),
                 LogisticRegression(C=cfg["features"]["embedding_logreg_C"], max_iter=3000),
             ).fit(E.loc[tr], y[tr])
+            # вероятность «мужчина» для валидации и метрики фолда при пороге 0.5
             p = clf.predict_proba(E.loc[va])[:, 1]
             rows.append(
                 {
@@ -91,28 +103,36 @@ def embedding_cv(X: pd.DataFrame, y: pd.Series, cfg: dict) -> dict:
 
 def training_matrix(X: pd.DataFrame, y: pd.Series, cfg: dict) -> tuple[LabelFeatures, pd.DataFrame]:
     """Матрица, на которой учатся финальные табличные модели: признаки с метками — out-of-fold."""
+    # признаки с метками для обучающих клиентов считаются out-of-fold по внутренним фолдам,
+    # чтобы финальный бустинг не учился на значениях, «видевших» метку того же клиента
     lf = LabelFeatures(cfg["features"], seed=cfg["seed"], n_inner=cfg["cv"]["inner_splits"])
     return lf, model_matrix(X, lf.fit_transform(X, y))
 
 
+# группы признаков без меток (префиксы колонок)
 UNLABELED_GROUPS = ("act", "amt", "mcc", "tt", "time", "term", "dyn")
 
 
 def group_signal(X: pd.DataFrame, y: pd.Series, cfg: dict, seed: int = 0) -> pd.DataFrame:
     """AUC LightGBM на каждой группе признаков без меток отдельно и на всех вместе (5-fold, повтор 0)."""
     ids = np.sort(y.index.to_numpy())
+    # префикс колонки (act, amt, mcc …) определяет группу
     prefix = X.columns.str.split("_").str[0]
     groups = {g: X.columns[prefix == g] for g in UNLABELED_GROUPS}
     groups["all"] = X.columns[np.isin(prefix, UNLABELED_GROUPS)]
+    # один повтор из 5 фолдов — для сравнения групп этого достаточно
     folds = make_folds(ids, y, cfg, 0)
     rows = []
     for g, cols in groups.items():
+        # LightGBM только на колонках группы, на каждом фолде — предсказания по сетке числа деревьев
         res = [
             models.gbm_staged(X.loc[tr, cols], y[tr].to_numpy(), X.loc[va, cols], cfg, seed)
             for tr, va in folds
         ]
         its = res[0][0]
+        # AUC-кривая каждого фолда по сетке числа деревьев
         curves = [np.array([roc_auc_score(y[va], p) for p in o[1]]) for o, (_, va) in zip(res, folds)]
+        # число деревьев для фолда — по остальным фолдам (вложенно), берём AUC фолда в этой точке
         rounds = models.nested_rounds(curves, its)
         aucs = [c[list(its).index(n)] for c, n in zip(curves, rounds)]
         rows.append(
@@ -125,15 +145,19 @@ def adversarial_auc(X_a: pd.DataFrame, X_b: pd.DataFrame, cfg: dict, seed: int =
     """Adversarial validation: отличает ли LightGBM клиентов двух сплитов по признакам без меток."""
     import lightgbm as lgb
 
+    # только признаки без меток: метки здесь не нужны
     cols = X_a.columns[np.isin(X_a.columns.str.split("_").str[0], UNLABELED_GROUPS)]
     X = pd.concat([X_a[cols], X_b[cols]])
+    # «метка» — из какого сплита клиент: 0 — первый (train), 1 — второй (test)
     s = np.r_[np.zeros(len(X_a)), np.ones(len(X_b))]
     params = dict(cfg["gbm"]["params"], seed=seed, num_threads=cfg["gbm"]["num_threads"])
     aucs, imp = [], np.zeros(len(cols))
+    # если классификатор не отличает сплиты (AUC ≈ 0.5), распределения похожи и CV репрезентативна
     for tr, va in StratifiedKFold(5, shuffle=True, random_state=seed).split(X, s):
         m = lgb.train(params, lgb.Dataset(X.iloc[tr], s[tr]), 500)
         aucs.append(roc_auc_score(s[va], m.predict(X.iloc[va])))
         imp += m.feature_importance("gain")
+    # признаки, которые сильнее всего «различают» сплиты, — для диагностики сдвига
     top = pd.Series(imp, index=cols).sort_values(ascending=False)
     return {
         "auc": float(np.mean(aucs)),
@@ -156,6 +180,7 @@ class GenderModel:
 
     @property
     def components(self) -> list[str]:
+        # модели бленда: gbm (LightGBM), seq (дообученный CoLES), tabpfn (если включён в конфиге)
         return [c for c in self.cfg["blend"]["components"] if c != "tabpfn" or self.cfg["tabpfn"]["enabled"]]
 
     def _print(self, msg: str) -> None:
@@ -174,10 +199,13 @@ class GenderModel:
         seed: int,
     ) -> dict:
         out: dict = {}
+        # признаки с метками учатся только на обучающих клиентах фолда: для них — out-of-fold по
+        # внутренним фолдам, для валидационных — по статистикам обучающих. Метки валидации не используются
         lf = LabelFeatures(self.cfg["features"], seed=seed, n_inner=self.cfg["cv"]["inner_splits"])
         M_tr = model_matrix(X.loc[tr], lf.fit_transform(X.loc[tr], y))
         M_va = model_matrix(X.loc[va], lf.transform(X.loc[va]))
         if "gbm" in self.components:
+            # LightGBM: предсказания валидации на сетке числа деревьев (выбор — позже, вложенно)
             out["gbm"] = models.gbm_staged(M_tr, y[tr].to_numpy(), M_va, self.cfg, seed)
             if self.cfg["report"].get("contribution", True) and "lr_emb" in M_tr:
                 # тот же бустинг без признака CoLES — для таблицы вклада компонентов
@@ -185,17 +213,21 @@ class GenderModel:
                     M_tr.drop(columns="lr_emb"), y[tr].to_numpy(), M_va.drop(columns="lr_emb"), self.cfg, seed
                 )
         if "tabpfn" in self.components:
+            # TabPFN: отбор 300 признаков и «обучение» — внутри фолда, только на обучающих клиентах
             tp = models.TabPFNModel(self.cfg, self.device, seed).fit(M_tr, y[tr].to_numpy())
             out["tabpfn"] = tp.predict_proba(M_va)
         if "seq" in self.components:
+            # CoLES: предобученный энкодер дообучается на пол только на обучающих клиентах фолда
             f = self.cfg["sequence"]["finetune"]
             logits = []
             for s in f["seeds"]:
                 clf = sequence.finetune(encoder_state, seqs, tr, y, self.cfg, self.device, seed=s)
                 logits.append(sequence.predict_logits(clf, seqs, va, self.device, f["predict_max_len"]))
+                # освобождаем память GPU перед следующим фолдом
                 del clf
                 if self.device == "cuda":
                     torch.cuda.empty_cache()
+            # при нескольких сидах — среднее логитов (в конфиге один сид)
             out["seq"] = np.mean(logits, 0)
         return out
 
@@ -213,6 +245,8 @@ class GenderModel:
         repeats = repeats or self.cfg["cv"]["repeats"]
         cols: dict[str, pd.Series] = {}
         t0 = time.time()
+        # 2 повтора × 5 фолдов; каждый клиент в каждом повторе ровно один раз попадает в валидацию,
+        # поэтому для каждого клиента есть out-of-fold предсказание каждой модели
         for r in range(repeats):
             folds = make_folds(ids, y, self.cfg, r)
             res = []
@@ -223,12 +257,16 @@ class GenderModel:
                 if c not in res[0]:
                     continue
                 its = res[0][c][0]
+                # AUC-кривые фолдов по числу деревьев
                 curves = [
                     np.array([roc_auc_score(y[va], p) for p in o[c][1]]) for o, (_, va) in zip(res, folds)
                 ]
+                # вложенный выбор: число деревьев для фолда k — по средней кривой остальных фолдов
                 rounds = models.nested_rounds(curves, its)
                 if c == "gbm":
+                    # выбранные числа деревьев запоминаем: финальная модель возьмёт их среднее
                     self.fold_rounds_ = getattr(self, "fold_rounds_", []) + rounds
+                # OOF: предсказания каждого фолда при выбранном числе деревьев, в логитах
                 cols[f"{c}_r{r}"] = pd.concat(
                     [
                         pd.Series(models.to_logit(o[c][1][list(its).index(n)]), index=va)
@@ -237,8 +275,10 @@ class GenderModel:
                 )
             for c in ("tabpfn", "seq"):
                 if c in self.components:
+                    # TabPFN отдаёт вероятности → в логиты; CoLES уже отдаёт логиты
                     vals = [models.to_logit(o[c]) if c == "tabpfn" else o[c] for o in res]
                     cols[f"{c}_r{r}"] = pd.concat([pd.Series(v, index=va) for v, (_, va) in zip(vals, folds)])
+        # таблица OOF-логитов: клиент × (модель, повтор)
         oof = pd.DataFrame(cols).reindex(ids)
         self.oof_ = oof
         self.fold_metrics = self._nested_blend_metrics(oof, y, repeats)
@@ -253,11 +293,14 @@ class GenderModel:
         thr = self.cfg["blend"]["threshold"]
         rows = []
         for r in range(repeats):
+            # OOF-логиты моделей этого повтора: клиенты × модели
             Z = oof[[f"{c}_r{r}" for c in components]].to_numpy()
             folds = make_folds(ids, y, self.cfg, r)
             pos = {c: i for i, c in enumerate(ids)}
             for k, (_, va) in enumerate(folds):
                 vi = np.array([pos[c] for c in va])
+                # калибровка и веса бленда учатся на клиентах остальных фолдов (rest), а оцениваются
+                # на фолде k — иначе подбор весов на тех же клиентах завысил бы метрику
                 rest = np.setdiff1d(np.arange(len(ids)), vi)
                 bl = models.LogitBlend(self.cfg["blend"]["weight_step"]).fit(Z[rest], yv[rest])
                 p = bl.predict_proba(Z[vi])
@@ -265,8 +308,10 @@ class GenderModel:
                     "repeat": r,
                     "fold": k,
                     "auc": roc_auc_score(yv[vi], p),
+                    # accuracy при пороге 0.5 по калиброванной вероятности
                     "accuracy": accuracy_score(yv[vi], p >= thr),
                 }
+                # AUC каждой модели по отдельности на этом фолде
                 for i, c in enumerate(components):
                     row[f"auc_{c}"] = roc_auc_score(yv[vi], Z[vi, i])
                 rows.append(row)
@@ -281,6 +326,7 @@ class GenderModel:
             "seq": "+ дообученный CoLES",
             "tabpfn": "+ TabPFN",
         }
+        # шаги: [агрегаты], [gbm], [gbm, seq], [gbm, seq, tabpfn] — модели добавляются по одной
         steps = [["gbm_agg"]] if any(c.startswith("gbm_agg_r") for c in self.oof_.columns) else []
         comps = []
         for c in self.components:
@@ -288,6 +334,7 @@ class GenderModel:
             steps.append(list(comps))
         rows, prev = [], None
         for st in steps:
+            # для каждого шага — вложенная оценка бленда из этих моделей на тех же 10 фолдах
             m = pd.DataFrame(self._nested_blend_metrics(self.oof_, y, repeats, st))
             auc, acc = m["auc"].mean(), m["accuracy"].mean()
             rows.append(
@@ -298,6 +345,7 @@ class GenderModel:
                     "auc_std": m["auc"].std(ddof=1),
                     "accuracy": acc,
                     "accuracy_std": m["accuracy"].std(ddof=1),
+                    # прирост AUC относительно предыдущего шага
                     "delta_auc": None if prev is None else auc - prev,
                 }
             )
@@ -315,6 +363,7 @@ class GenderModel:
             "seq": "CoLES, дообученный на пол",
             "tabpfn": "TabPFN v2, 300 признаков",
         }
+        # «бленд из одной модели» = только её Platt-калибровка; так accuracy моделей сравнимы
         comps = [c for c in names if any(k.startswith(f"{c}_r") for k in self.oof_.columns)]
         steps = [(names[c], [c]) for c in comps] + [("Бленд = итог", self.components)]
         return pd.DataFrame(
@@ -326,12 +375,14 @@ class GenderModel:
         вложенным выбором итераций, что LightGBM; метрики, парное сравнение с LightGBM и бленд с ними."""
         ids = np.sort(y.index.to_numpy())
         repeats = sum(c.startswith("gbm_r") for c in self.oof_.columns)
+        # сравниваемые бустинги; OOF-логиты LightGBM берутся из уже посчитанной CV (self.oof_)
         staged = {"xgb": models.xgb_staged, "cat": models.cat_staged}
         cols: dict[str, pd.Series] = {}
         for r in range(repeats):
             folds = make_folds(ids, y, self.cfg, r)
             res = {name: [] for name in staged}
             for k, (tr, va) in enumerate(folds):
+                # та же матрица, что у LightGBM в этом фолде: признаки с метками с тем же сидом, out-of-fold
                 lf = LabelFeatures(
                     self.cfg["features"], seed=r * 10 + k, n_inner=self.cfg["cv"]["inner_splits"]
                 )
@@ -340,6 +391,7 @@ class GenderModel:
                 for name, fn in staged.items():
                     res[name].append(fn(M_tr, y[tr].to_numpy(), M_va, self.cfg, r * 10 + k))
                 self._print(f"  comparison repeat {r} fold {k} done")
+            # вложенный выбор числа деревьев и OOF-логиты — так же, как для LightGBM
             for name, out in res.items():
                 its = out[0][0]
                 curves = [np.array([roc_auc_score(y[va], p) for p in o[1]]) for o, (_, va) in zip(out, folds)]
@@ -351,12 +403,14 @@ class GenderModel:
                     ]
                 )
         oof = pd.concat([self.oof_, pd.DataFrame(cols).reindex(self.oof_.index)], axis=1)
+        # база для парных сравнений: LightGBM отдельно и итоговый бленд
         base = pd.DataFrame(self._nested_blend_metrics(oof, y, repeats, ["gbm"]))
         final = pd.DataFrame(self._nested_blend_metrics(oof, y, repeats, self.components))
         rows = []
         for name in staged:
             m = pd.DataFrame(self._nested_blend_metrics(oof, y, repeats, [name]))
             b = pd.DataFrame(self._nested_blend_metrics(oof, y, repeats, [*self.components, name]))
+            # парные разности по тем же 10 фолдам: модель − LightGBM и (бленд + модель) − бленд
             d, db = m["auc"] - base["auc"], b["auc"] - final["auc"]
             rows.append(
                 {
@@ -380,17 +434,23 @@ class GenderModel:
     ) -> GenderModel:
         """Бленд по OOF (повтор 0) и финальные модели на всех размеченных клиентах."""
         ids = np.sort(y.index.to_numpy())
+        # калибровка и веса бленда — по OOF-логитам первого повтора (честные, вне обучения моделей)
         Z = self.oof_[[f"{c}_r0" for c in self.components]].to_numpy()
         self.blend_ = models.LogitBlend(self.cfg["blend"]["weight_step"]).fit(Z, y.reindex(ids).to_numpy())
+        # матрица всех 6 720 размеченных клиентов: признаки с метками — out-of-fold
         self.label_features_, M = training_matrix(X.loc[ids], y, self.cfg)
+        # порядок колонок запоминаем: при предсказании матрица будет такой же
         self.columns_ = list(M.columns)
         yv = y.reindex(ids).to_numpy()
         if "gbm" in self.components:
+            # деревьев: среднее выбранного по фолдам × 1.25 — данных на 25% больше, чем в части фолда
             self.rounds_ = int(np.mean(self.fold_rounds_) * self.cfg["gbm"]["final_rounds_scale"])
             self.gbm_ = [models.gbm_fit(M, yv, self.rounds_, self.cfg, s) for s in self.cfg["gbm"]["seeds"]]
         if "tabpfn" in self.components:
+            # TabPFN: отбор 300 признаков по LightGBM и контекст из всех 6 720 клиентов
             self.tabpfn_ = models.TabPFNModel(self.cfg, self.device, self.cfg["seed"]).fit(M, yv)
         if "seq" in self.components:
+            # дообучение CoLES на всех размеченных клиентах; на CPU — чтобы сохранять без GPU-тензоров
             self.seq_ = [
                 sequence.finetune(encoder_state, seqs, ids, y, self.cfg, self.device, seed=s).cpu()
                 for s in self.cfg["sequence"]["finetune"]["seeds"]
@@ -399,14 +459,19 @@ class GenderModel:
 
     def matrix(self, X: pd.DataFrame) -> pd.DataFrame:
         """Матрица табличных моделей: признаки без меток + признаки с метками по статистикам обучения."""
+        # для новых клиентов (test) признаки с метками — по статистикам всех обучающих клиентов;
+        # [self.columns_] — тот же набор и порядок колонок, что при обучении
         return model_matrix(X, self.label_features_.transform(X))[self.columns_]
 
     def component_logits(self, X: pd.DataFrame, seqs: sequence.Sequences | None) -> pd.DataFrame:
+        # логиты трёх моделей для клиентов X → вход бленда (клиенты × модели)
         M = self.matrix(X)
         out = {}
         if "gbm" in self.components:
+            # LightGBM: вероятность (среднее по сидам) → логит
             out["gbm"] = models.to_logit(np.mean([m.predict(M) for m in self.gbm_], 0))
         if "tabpfn" in self.components:
+            # TabPFN: вероятность → логит
             out["tabpfn"] = models.to_logit(self.tabpfn_.predict_proba(M))
         if "seq" in self.components:
             f = self.cfg["sequence"]["finetune"]
@@ -419,15 +484,18 @@ class GenderModel:
                 ],
                 0,
             )
+        # порядок колонок — как при обучении бленда
         return pd.DataFrame(out, index=X.index)[self.components]
 
     def predict_proba(self, X: pd.DataFrame, seqs: sequence.Sequences | None) -> np.ndarray:
+        # итоговая вероятность «мужчина»: логиты моделей → калиброванный бленд
         return self.blend_.predict_proba(self.component_logits(X, seqs).to_numpy())
 
     # ------------------------------------------------------------ сохранение
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
+        # описание модели: компоненты, колонки матрицы, параметры бленда, число деревьев
         meta = {
             "components": self.components,
             "columns": self.columns_,
@@ -435,6 +503,7 @@ class GenderModel:
             "rounds": getattr(self, "rounds_", None),
         }
         (path / "model.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1))
+        # статистики признаков с метками (TE, IDF, логреги) — нужны, чтобы считать признаки для test
         with open(path / "label_features.pkl", "wb") as fh:
             pickle.dump(self.label_features_, fh)
         for i, m in enumerate(getattr(self, "gbm_", [])):
@@ -442,6 +511,7 @@ class GenderModel:
         if hasattr(self, "tabpfn_"):
             with open(path / "tabpfn.pkl", "wb") as fh:
                 pickle.dump(self.tabpfn_, fh)
+        # веса CoLES в half precision — вдвое меньше файл, на предсказания не влияет заметно
         for i, m in enumerate(getattr(self, "seq_", [])):
             torch.save(
                 {k: v.half() if v.is_floating_point() else v for k, v in m.state_dict().items()},
@@ -456,16 +526,20 @@ class GenderModel:
         path = Path(path)
         meta = json.loads((path / "model.json").read_text())
         m = cls(cfg=cfg, device=device)
+        # состав бленда берём из сохранённой модели, а не из текущего конфига
         m.cfg = dict(cfg, blend=dict(cfg["blend"], components=meta["components"]))
         m.columns_, m.blend_ = meta["columns"], models.LogitBlend.from_dict(meta["blend"])
         with open(path / "label_features.pkl", "rb") as fh:
             m.label_features_ = pickle.load(fh)
+        # LightGBM — из текстовых файлов модели, TabPFN — из pickle с обучающей матрицей
         m.gbm_ = [lgb.Booster(model_file=str(p)) for p in sorted(path.glob("gbm_*.txt"))]
         if (path / "tabpfn.pkl").exists():
             with open(path / "tabpfn.pkl", "rb") as fh:
                 m.tabpfn_ = pickle.load(fh)
+            # устройство — текущее (модель могла обучаться на GPU, а загружаться на CPU)
             m.tabpfn_.device = device
         m.seq_ = []
+        # веса CoLES сохранены в half — возвращаем в float32
         for p in sorted(path.glob("seq_*.pt")):
             clf = sequence.SeqClassifier(sequence.build_encoder(seqs, cfg))
             clf.load_state_dict({k: v.float() for k, v in torch.load(p, map_location="cpu").items()})
@@ -475,6 +549,7 @@ class GenderModel:
 
 
 def save_vocab(vocab: Vocab, path: str | Path) -> None:
+    # словарь категорий train сохраняется рядом с моделью: при загрузке колонки будут те же
     Path(path).write_text(json.dumps(vocab.to_dict()))
 
 
@@ -484,6 +559,7 @@ def load_vocab(path: str | Path) -> Vocab:
 
 def model_summary(results: str | Path) -> pd.DataFrame:
     """Сравнение моделей на одних и тех же 10 фолдах CV: AUC, accuracy, участие в итоговой модели."""
+    # всё читается из results/: метрики посчитаны при обучении, здесь только сводка
     res = Path(results)
     meta = json.loads((res / "cv_metrics.json").read_text())
     weights = dict(zip(meta["components"], meta["blend_weights"]))
@@ -493,6 +569,7 @@ def model_summary(results: str | Path) -> pd.DataFrame:
     def fmt(mean: float, std: float) -> str:
         return f"{mean:.4f} ± {std:.4f}"
 
+    # строки таблицы: модель, её метрики, участие в итоговой модели
     rows = [
         ("LightGBM", m.loc["LightGBM, агрегаты + признак CoLES"], f"да, вес {weights['gbm']:.2f}"),
         ("XGBoost", cmp.loc["xgb"], "нет: вровень с LightGBM"),
@@ -518,10 +595,12 @@ def hyperparameter_summary(
     cfg: dict, results: str | Path = "results", n_trees: int | None = None
 ) -> pd.DataFrame:
     """Ключевые гиперпараметры по моделям одной таблицей: модель, параметры, как выбраны."""
+    # значения — из конфига, веса бленда — из results/, число деревьев — из загруженной модели (если есть)
     g, gp, e = cfg["gbm"], cfg["gbm"]["params"], cfg["sequence"]["encoder"]
     p, f, t = cfg["sequence"]["pretrain"], cfg["sequence"]["finetune"], cfg["tabpfn"]
     meta = json.loads((Path(results) / "cv_metrics.json").read_text())
     w = dict(zip(meta["components"], meta["blend_weights"]))
+    # при RETRAIN = True финальной модели ещё нет — тогда указываем верхнюю границу сетки
     trees = f"деревьев: {n_trees}" if n_trees else f"деревьев: до {g['max_rounds']}"
     rows = [
         (

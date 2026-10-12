@@ -54,12 +54,17 @@ class Context:
 
     def features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Признаки одного сплита: агрегаты без меток + эмбеддинги CoLES; события — в SEQ_STORE."""
+        # сырые строки → компактные события (день, час, флаг 00:00:00, знак и лог-сумма)
         ev = prepare_events(df)
+        # регистрируем последовательности сплита: их достанет CoLES в fit_predict_proba
         SEQ_STORE.add(ev)
+        # агрегаты клиента без меток; колонки фиксированы словарём из train
         X = features.client_features(ev, self.vocab, self.cfg["features"])
+        # эмбеддинг CoLES (1024 числа) по последним операциям каждого клиента
         E = sequence.embed(
             self.encoder, self.seqs, X.index, self.device, self.cfg["sequence"]["pretrain"]["embed_max_len"]
         )
+        # одна таблица на клиента: агрегаты + эмбеддинг
         return pd.concat([X, E.astype(np.float32)], axis=1)
 
 
@@ -68,17 +73,20 @@ class ArtifactsUnavailableError(RuntimeError):
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # запрещаем автоматический переход по редиректу: адрес файла нужен, чтобы скачать его без токена
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, D102
         return None
 
 
 def _download(url: str, target: Path, headers: dict | None = None) -> None:
+    # потоковое скачивание файла по URL в target; таймаут 60 с на соединение и чтение
     req = urllib.request.Request(url, headers=headers or {})
     with urllib.request.urlopen(req, timeout=60) as r, open(target, "wb") as fh:
         shutil.copyfileobj(r, fh)
 
 
 def _from_url(rel: dict, target: Path) -> str:
+    # источник 1: публичная ссылка на архив в GitHub Release — без авторизации
     if not rel.get("url"):
         raise LookupError("публичная ссылка не задана (artifacts_release.url)")
     _download(rel["url"], target)
@@ -86,10 +94,12 @@ def _from_url(rel: dict, target: Path) -> str:
 
 
 def _from_gh(rel: dict, target: Path) -> str:
+    # источник 2: GitHub CLI — только если он установлен и авторизован
     if shutil.which("gh") is None:
         raise LookupError("gh не установлен")
     if subprocess.run(["gh", "auth", "status"], capture_output=True).returncode != 0:
         raise LookupError("gh не авторизован")
+    # gh release download: только нужный файл релиза в папку artifacts/, с перезаписью
     cmd = [
         "gh",
         "release",
@@ -103,6 +113,7 @@ def _from_gh(rel: dict, target: Path) -> str:
         str(target.parent),
         "--clobber",
     ]
+    # вывод gh перехватываем: при ошибке покажем его текст в сообщении
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         raise LookupError(f"gh release download: {res.stderr.strip()}")
@@ -110,11 +121,14 @@ def _from_gh(rel: dict, target: Path) -> str:
 
 
 def _from_token(rel: dict, target: Path) -> str:
+    # источник 3: GitHub API с токеном из переменной окружения (без gh)
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if not token:
         raise LookupError("нет GH_TOKEN / GITHUB_TOKEN")
+    # адрес API релизов и заголовок авторизации с токеном
     api = f"https://api.github.com/repos/{rel['repo']}/releases"
     auth = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    # описание релиза по тегу → список файлов (ассетов)
     try:
         with urllib.request.urlopen(
             urllib.request.Request(f"{api}/tags/{rel['tag']}", headers=auth), timeout=60
@@ -135,6 +149,7 @@ def _from_token(rel: dict, target: Path) -> str:
     except urllib.error.HTTPError as e:
         if e.code not in (301, 302, 303, 307, 308):
             raise LookupError(f"GitHub API: HTTP {e.code}") from e
+        # адрес хранилища из заголовка Location — скачиваем уже без токена
         _download(e.headers["Location"], target)
     return "GitHub API (токен)"
 
@@ -143,11 +158,14 @@ def fetch_artifacts(cfg: dict) -> None:
     """Готовит artifacts/: уже распакованные файлы, ``artifacts/artifacts.zip``, положенный вручную,
     либо скачивание из GitHub Release — по публичной ссылке, через ``gh`` или по токену ``GH_TOKEN``."""
     path = Path(cfg["paths"]["artifacts"])
+    # модель уже распакована — ничего не делаем
     if (path / "model" / "model.json").exists():
         return
+    # где лежит архив: репозиторий, тег релиза, имя файла, публичная ссылка
     rel = cfg["artifacts_release"]
     path.mkdir(parents=True, exist_ok=True)
     archive = path / rel["asset"]
+    # архив, положенный вручную, используется как есть; иначе перебираем источники по порядку
     if not archive.exists():
         errors = []
         for source in (_from_url, _from_gh, _from_token):
@@ -155,9 +173,11 @@ def fetch_artifacts(cfg: dict) -> None:
                 print(f"artifacts: скачано ({source(rel, archive)})")
                 break
             except (LookupError, OSError) as e:
+                # неудачная попытка могла оставить недокачанный файл — удаляем его
                 archive.unlink(missing_ok=True)
                 errors.append(f"  - {e}")
         else:
+            # ни один источник не сработал: понятное сообщение с причинами и вариантами действий
             raise ArtifactsUnavailableError(
                 f"Не удалось получить {rel['asset']} из релиза {rel['tag']} репозитория {rel['repo']}:\n"
                 + "\n".join(errors)
@@ -169,6 +189,7 @@ def fetch_artifacts(cfg: dict) -> None:
                 "  4) обучить всё заново: retrain: true в configs/default.yaml / RETRAIN = True"
                 " в ноутбуке / make train (GPU, ~25 мин)."
             )
+    # распаковываем: энкодер, словарь, финальные модели, OOF
     with zipfile.ZipFile(archive) as z:
         z.extractall(path)
     if not (path / "model" / "model.json").exists():
@@ -180,15 +201,20 @@ def build_context(cfg: dict, splits: dict[str, pd.DataFrame], log: bool = True) 
     set_seed(cfg["seed"])
     device = get_device(cfg)
     art = Path(cfg["paths"]["artifacts"])
+    # если хоть что-то берётся готовым — нужны артефакты из GitHub Release
     if not cfg["retrain_seq"] or not cfg["retrain_tabular"]:
         fetch_artifacts(cfg)
+    # словарь категорий: сохранённый вместе с моделью (те же колонки, что при обучении)
+    # или построенный заново по train при полном пересчёте
     vocab = (
         cv.load_vocab(art / "vocab.json")
         if (art / "vocab.json").exists() and not cfg["retrain_tabular"]
         else Vocab.from_train(splits["train"], cfg["features"]["top_mcc_amount"])
     )
+    # последовательности всех клиентов всех сплитов (без меток) — для эмбеддингов и CoLES
     ev = prepare_events(pd.concat(splits.values(), ignore_index=True))
     seqs = sequence.Sequences(ev, vocab)
+    # веса предобученного энкодера CoLES
     enc_path = art / "encoder.pt"
     if cfg["retrain_seq"]:
         p = cfg["sequence"]["pretrain"]
@@ -198,11 +224,13 @@ def build_context(cfg: dict, splits: dict[str, pd.DataFrame], log: bool = True) 
             if p["clients"] == "all"
             else np.concatenate([splits[s]["customer_id"].unique() for s in ("train", "val")])
         )
+        # контрастное предобучение CoLES и сохранение энкодера и словаря
         encoder = sequence.pretrain(seqs, clients, cfg, device, cfg["seed"], verbose=log)
         art.mkdir(parents=True, exist_ok=True)
         torch.save(encoder.state_dict(), enc_path)
         cv.save_vocab(vocab, art / "vocab.json")
     else:
+        # готовый энкодер из артефактов
         encoder = sequence.build_encoder(seqs, cfg)
         encoder.load_state_dict(torch.load(enc_path, map_location="cpu"))
     return Context(cfg, device, vocab, seqs, encoder.to(device).eval())
@@ -212,27 +240,33 @@ def train(cfg: dict, ctx: Context | None = None, splits: dict | None = None) -> 
     """Кросс-валидация на train+val, финальные модели на всех размеченных клиентах, сохранение."""
     splits = splits or {s: load_split(s, cfg["paths"]["data"]) for s in SPLITS}
     ctx = ctx or build_context(cfg, splits)
+    # обучающая выборка — все размеченные клиенты: train + val (6 720)
     lab = pd.concat([splits["train"], splits["val"]], ignore_index=True)
     X, y = ctx.features(lab), labels(lab)
     model = cv.GenderModel(cfg, ctx.device)
+    # 2 × 5 фолдов: OOF-предсказания и честные метрики; затем финальные модели на всех 6 720
     model.cross_validate(X, y, ctx.seqs, ctx.encoder.state_dict())
     model.fit_final(X, y, ctx.seqs, ctx.encoder.state_dict())
     model.save(ctx.artifacts / "model")
+    # таблицы результатов для ноутбука, отчёта и графиков
     write_cv_results(cfg, model, y)
     write_model_table(cfg, model, X, y)
     if cfg.get("comparison", {}).get("enabled"):
         write_comparison(cfg, model, X, y)
     write_descriptive_results(cfg, model, splits["train"])
+    # adversarial validation использует признаки test без меток
     write_data_results(cfg, X, y, ctx.features(splits["train"]), ctx.features(splits["test"]))
     return model
 
 
 def _mcc_desc(train: pd.DataFrame) -> dict[int, str]:
+    # код MCC → текстовое описание (для подписей графиков)
     if "mcc_code_desc" not in train:
         return {}
     return train.drop_duplicates("mcc_code").set_index("mcc_code")["mcc_code_desc"].astype(str).to_dict()
 
 
+# подписи сводок target encoding и отдельных признаков для графиков важности
 TE_STATS = {
     "wmean": "среднее по операциям",
     "mean": "среднее по категориям",
@@ -263,16 +297,20 @@ def feature_label(name: str, mcc_desc: dict[int, str]) -> str:
     parts = name.split("_")
     if name in NAMED:
         return NAMED[name]
+    # mcc_cnt_<код>, mcc_sum_<код>, mcc_la_<код> → «MCC «описание»: что считаем»
     if parts[0] == "mcc" and parts[1] in ("cnt", "sum", "la") and parts[-1].isdigit():
         what = {"cnt": "доля операций", "sum": "доля трат", "la": "средний чек"}[parts[1]]
         return f"MCC «{mcc_desc.get(int(parts[-1]), parts[-1])[:32]}»: {what}"
+    # te_mcc_<сводка>, te_tt_<сводка> → «Target encoding MCC: что за сводка»
     if parts[0] == "te":
         what = "MCC" if parts[1] == "mcc" else "типа"
         return f"Target encoding {what}: {TE_STATS.get('_'.join(parts[2:]), '')}"
+    # доли операций / трат по дню недели и по часу
     if name.startswith("time_dow_"):
         return f"День недели {parts[-1]}: доля {'операций' if parts[2] == 'cnt' else 'трат'}"
     if name.startswith("time_hour_") and parts[-1].isdigit():
         return f"Доля операций в {parts[-1]} ч"
+    # остальные признаки подписываются именем колонки
     return name
 
 
@@ -280,15 +318,19 @@ def write_descriptive_results(cfg: dict, model: cv.GenderModel, train: pd.DataFr
     """Таблицы для графиков: перекос MCC по полу (только train) и важности финального LightGBM."""
     res = Path(cfg["paths"]["results"])
     desc = _mcc_desc(train)
+    # клиент × MCC: True, если клиент хотя бы раз платил в категории (метки — только train)
     pres = train.groupby(["customer_id", "mcc_code"]).size().unstack(fill_value=0) > 0
     g = labels(train).reindex(pres.index)
+    # n — клиентов в категории; доля мужчин среди них = (матрица присутствия)ᵀ · метки / n
     n = pres.sum()
     skew = pd.DataFrame(
         {"mcc": n.index, "n_clients": n.to_numpy(), "male_share": (pres.T @ g / n).to_numpy()}
     )
+    # только категории с ≥ 200 клиентами: на меньших выборках доля мужчин слишком шумная
     skew = skew[skew["n_clients"] >= 200].assign(base=g.mean(), desc=lambda d: d["mcc"].map(desc).fillna(""))
     skew.to_csv(res / "mcc_gender_skew.csv", index=False)
     if getattr(model, "gbm_", None):
+        # важность признаков финального LightGBM: суммарный gain (насколько признак уменьшает потерю)
         gain = np.mean([m.feature_importance("gain") for m in model.gbm_], 0)
         imp = pd.DataFrame({"feature": model.gbm_[0].feature_name(), "gain": gain})
         imp = imp.assign(gain_share=imp["gain"] / imp["gain"].sum()).sort_values("gain", ascending=False)
@@ -308,13 +350,16 @@ def fit_predict(
     """Интерфейс шаблона: train и val объединяются в обучающую выборку, test только предсказывается."""
     cfg = ctx.cfg
     if cfg["retrain_tabular"]:
+        # полный пересчёт: CV на train + val (нужна для OOF бленда) и финальные модели
         X, y = pd.concat([X_train, X_val]), pd.concat([y_train, y_val])
         model = cv.GenderModel(cfg, ctx.device)
         model.cross_validate(X, y, ctx.seqs, ctx.encoder.state_dict())
         model.fit_final(X, y, ctx.seqs, ctx.encoder.state_dict())
         model.save(ctx.artifacts / "model")
     else:
+        # готовая финальная модель из artifacts/
         model = cv.GenderModel.load(ctx.artifacts / "model", cfg, ctx.device, ctx.seqs)
+    # test только предсказывается: вероятность «мужчина» и класс по порогу 0.5
     proba = model.predict_proba(X_test, ctx.seqs)
     return proba, (proba >= cfg["blend"]["threshold"]).astype(int)
 
@@ -323,8 +368,10 @@ def write_cv_results(cfg: dict, model: cv.GenderModel, y: pd.Series) -> dict:
     res = Path(cfg["paths"]["results"])
     model.contribution_ = model.contribution(y)
     res.mkdir(parents=True, exist_ok=True)
+    # метрики итогового бленда по каждому из 10 фолдов
     folds = pd.DataFrame(model.fold_metrics)
     folds.to_csv(res / "cv_folds.csv", index=False)
+    # сводка CV: среднее ± std по фолдам, веса бленда, сколько фолдов ниже требований задания
     summary = {
         "components": model.components,
         "blend_weights": model.blend_.weights_.tolist(),
@@ -343,6 +390,7 @@ def write_cv_results(cfg: dict, model: cv.GenderModel, y: pd.Series) -> dict:
 
 def write_model_table(cfg: dict, model: cv.GenderModel, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
     """Метрики CV по каждой модели и бленду -> results/cv_models.csv."""
+    # каждая модель отдельно + эмбеддинг CoLES с логрегом — на тех же фолдах
     t = model.model_table(y)
     t = pd.concat([pd.DataFrame([cv.embedding_cv(X, y, cfg)]), t], ignore_index=True)
     t.to_csv(Path(cfg["paths"]["results"]) / "cv_models.csv", index=False)
@@ -361,7 +409,9 @@ def write_data_results(
 ) -> None:
     """Сила сигнала групп признаков (метки train+val) и adversarial validation train vs test (без меток)."""
     res = Path(cfg["paths"]["results"])
+    # AUC LightGBM на каждой группе признаков (метки train + val)
     cv.group_signal(X_lab, y, cfg).to_csv(res / "group_signal.csv", index=False)
+    # отличимы ли train и test по признакам без меток (AUC ≈ 0.5 — нет)
     adv = cv.adversarial_auc(X_train, X_test, cfg)
     (res / "adversarial_validation.json").write_text(json.dumps(adv, indent=1, ensure_ascii=False))
 
@@ -373,15 +423,19 @@ def evaluate(
     splits = splits or {s: load_split(s, cfg["paths"]["data"]) for s in SPLITS}
     ctx = ctx or build_context(cfg, splits)
     model = model or cv.GenderModel.load(ctx.artifacts / "model", cfg, ctx.device, ctx.seqs)
+    # признаки test считаются так же, как для train; метки test нужны только для метрик
     X_test, y_test = ctx.features(splits["test"]), labels(splits["test"])
     p = model.predict_proba(X_test, ctx.seqs)
     rep = cfg["report"]
+    # AUC и accuracy с 95% интервалами по bootstrap-перевыборке клиентов test
     m = cv.bootstrap_ci(
         y_test.reindex(X_test.index).to_numpy(), p, cfg["blend"]["threshold"], rep["bootstrap"], rep["ci"]
     )
+    # метрики test с интервалами → results/test_metrics.json
     res = Path(cfg["paths"]["results"])
     res.mkdir(parents=True, exist_ok=True)
     (res / "test_metrics.json").write_text(json.dumps(m, indent=1))
+    # предсказания test сохраняются для графика ROC
     pd.DataFrame(
         {"proba": p, "gender": y_test.reindex(X_test.index).to_numpy()}, index=X_test.index
     ).to_parquet(res / "test_predictions.parquet")
@@ -395,11 +449,13 @@ def figures(cfg: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # команды: data — скачать данные, train — обучить всё, evaluate — оценить на test, figures — графики
     ap = argparse.ArgumentParser(prog="gender-pred")
     ap.add_argument("command", choices=["data", "train", "evaluate", "figures"])
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--retrain", action="store_true", help="полный пересчёт вместо артефактов из Release")
     args = ap.parse_args(argv)
+    # --retrain включает пересчёт всех частей (энкодер, табличные модели, бленд)
     cfg = load_config(
         args.config,
         **({"retrain": True, "retrain_tabular": True, "retrain_seq": True} if args.retrain else {}),
@@ -407,13 +463,16 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "data":
         download_data(cfg["paths"]["data"])
     elif args.command == "train":
+        # train всегда обучает всё заново; данные скачиваются, если их ещё нет
         download_data(cfg["paths"]["data"])
         train(dict(cfg, retrain=True, retrain_tabular=True, retrain_seq=True))
     elif args.command == "evaluate":
+        # evaluate сразу после клона: сам скачивает данные и артефакты
         download_data(cfg["paths"]["data"])
         try:
             print(json.dumps(evaluate(cfg), indent=1))
         except ArtifactsUnavailableError as e:
+            # понятное сообщение и код выхода 1 вместо трассировки
             sys.exit(f"Ошибка: {e}")
     else:
         figures(cfg)
